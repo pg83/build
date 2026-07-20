@@ -154,17 +154,28 @@ class BuildSystemTest(unittest.TestCase):
         cxx_command = app.nodes[1].commands[0]
         self.assertEqual(
             c_command[1:c_command.index("-c")],
-            ["-global-cpp", "-global-c", "-I$(S)", "-dep-cpp", "-dep-c", "-local-cpp", "-local-c"],
+            ["-I$(S)", "-global-cpp", "-global-c", "-dep-cpp", "-dep-c", "-local-cpp", "-local-c"],
         )
         self.assertEqual(
             cxx_command[1:cxx_command.index("-c")],
             [
-                "-global-cpp", "-global-c", "-global-cxx", "-I$(S)",
+                "-I$(S)", "-global-cpp", "-global-c", "-global-cxx",
                 "-dep-cpp", "-dep-c", "-dep-cxx",
                 "-local-cpp", "-local-c", "-local-cxx",
             ],
         )
         self.assertEqual(app.root.commands[0][-3:], ["-global-ld", "-dep-ld", "-local-ld"])
+
+    def test_project_includes_precede_environment_dependencies(self):
+        (self.root / "main.cpp").write_text("int main() {}\n")
+        context = self.context()
+        context.cppflags = ["-I/external/dependency"]
+        app = context.program(name="app", srcs=["$(S)/main.cpp"])
+        context.build_graph()
+
+        command = app.nodes[0].commands[0]
+        self.assertLess(command.index("-I$(S)"),
+                        command.index("-I/external/dependency"))
 
     def test_node_descriptions_and_colors(self):
         (self.root / "thing.cpp").write_text("int thing;\n")
