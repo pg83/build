@@ -220,6 +220,50 @@ class BuildSystemTest(unittest.TestCase):
         )
         self.assertIn(generated.root, compile_node.deps)
 
+    def test_include_roots_are_reverse_indexed_with_one_walk_each(self):
+        (self.root / "src").mkdir()
+        (self.root / "src/main.cpp").write_text(
+            '#include "local.h"\n#include "../parent.h"\n'
+            '#include <api/public.h>\n#include <missing.h>\n',
+        )
+        (self.root / "src/local.h").write_text("// local\n")
+        (self.root / "parent.h").write_text("// parent\n")
+        for name, marker in (("first", "first"), ("second", "second")):
+            (self.root / name / "api").mkdir(parents=True)
+            (self.root / name / "api/public.h").write_text(f"// {marker}\n")
+
+        context = self.context()
+        context.includes = ["$(S)/first", "$(S)/second"]
+        app = context.program(name="app", srcs=["$(S)/src/main.cpp"])
+        real_walk = runner.os.walk
+        with mock.patch.object(runner.os, "walk", wraps=real_walk) as walk:
+            context.build_graph()
+
+        walked = [Path(call.args[0]) for call in walk.call_args_list]
+        for root in (self.root, self.root / "first", self.root / "second"):
+            self.assertEqual(walked.count(root), 1)
+        self.assertEqual(
+            app.nodes[0].source_inputs,
+            {
+                "$(S)/src/main.cpp",
+                "$(S)/src/local.h",
+                "$(S)/parent.h",
+                "$(S)/first/api/public.h",
+            },
+        )
+
+    def test_include_resolution_does_not_stat_each_candidate(self):
+        (self.root / "main.cpp").write_text(
+            "".join(f"#include <missing-{index}.h>\n" for index in range(100)),
+        )
+        context = self.context()
+        context.includes = [f"$(S)/include-{index}" for index in range(20)]
+        app = context.program(name="app", srcs=["$(S)/main.cpp"])
+
+        with mock.patch.object(Path, "is_file", side_effect=AssertionError("per-include stat")):
+            context.build_graph()
+        self.assertEqual(app.nodes[0].source_inputs, {"$(S)/main.cpp"})
+
     def test_header_content_changes_compile_uid(self):
         (self.root / "main.c").write_text('#include "value.h"\nint main(void) { return V; }\n')
         header = self.root / "value.h"
