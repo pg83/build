@@ -4,6 +4,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import os
 import shutil
 import signal
 import subprocess
@@ -440,6 +441,54 @@ class BuildSystemTest(unittest.TestCase):
             context.publish([target])
         self.assertEqual(source.read_text(), "keep")
 
+    def test_build_py_reads_declared_flags(self):
+        (self.root / "build.py").write_text(
+            "import build\n"
+            "build.flags.allow({\n"
+            "    'VARIANT': {'descr': 'build variant', 'default': 'debug'},\n"
+            "    'EXTRA': {'descr': 'unused'},\n"
+            "})\n"
+            "app = command(name='app', outputs=['$(B)/' + build.flags.VARIANT],\n"
+            "              cmd=[['true']])\n",
+        )
+        context = runner.BuildContext(
+            self.root, self.out, runner.Flags({"VARIANT": "release"}),
+        )
+        context.load(self.root / "build.py")
+        self.assertEqual(context.target_names["app"].outputs, ["$(B)/release"])
+
+    def test_uid_calculation_resolves_command_tools(self):
+        context = self.context()
+        target = context.command(name="touch", outputs=["$(B)/out"], cmd=[["true"]])
+        context.build_graph()
+        context.calculate_uids([target.root])
+        resolved = target.root.commands[0][0]
+        self.assertTrue(os.path.isabs(resolved))
+        self.assertEqual(resolved, os.path.realpath(shutil.which("true")))
+
+    def test_resolve_tool_rejects_missing_command(self):
+        with self.assertRaisesRegex(runner.BuildError, "command not found in PATH"):
+            self.context().resolve_tool("definitely-not-a-real-tool-4f9a1")
+
+    def test_cli_help_lists_declared_flags(self):
+        project = self.root / "project"
+        project.mkdir()
+        shutil.copy2(ROOT / "build", project / "build")
+        (project / "build.py").write_text(
+            "import build\n"
+            "build.flags.allow({'LTO': {'descr': 'enable lto', 'default': 'no'}})\n"
+            "app = command(name='app', outputs=['$(B)/app'], cmd=[['true']])\n"
+            "install(app)\n",
+        )
+        result = subprocess.run(
+            [str(project / "build"), "-h"], cwd=project,
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.assertIn("Build flags", result.stdout)
+        self.assertIn("LTO", result.stdout)
+        self.assertIn("enable lto", result.stdout)
+        self.assertIn("(default: no)", result.stdout)
+
     def test_parser_ignores_commented_directives(self):
         source = self.root / "source.c"
         source.write_text(
@@ -490,6 +539,46 @@ class BuildSystemTest(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
                 process.wait()
+
+
+class FlagsTest(unittest.TestCase):
+    def test_parse_defines(self):
+        self.assertEqual(
+            runner.parse_defines(["A=B", "C", "D="]),
+            {"A": "B", "C": "yes", "D": ""},
+        )
+        with self.assertRaisesRegex(runner.BuildError, "malformed -D flag"):
+            runner.parse_defines(["=value"])
+
+    def test_unset_flag_reads_as_empty_string(self):
+        flags = runner.Flags({"NAME": "value"})
+        self.assertEqual(flags.NAME, "value")
+        self.assertEqual(flags["NAME"], "value")
+        self.assertEqual(flags.MISSING, "")
+        self.assertFalse(flags.MISSING)
+        self.assertIn("NAME", flags)
+        self.assertNotIn("MISSING", flags)
+
+    def test_allow_rejects_unknown_flags_and_applies_defaults(self):
+        flags = runner.Flags({"KNOWN": "yes"})
+        flags.allow({
+            "KNOWN": {"descr": "known flag"},
+            "TUNED": {"descr": "tunable", "default": "3"},
+        })
+        self.assertEqual(flags.KNOWN, "yes")
+        self.assertEqual(flags.TUNED, "3")
+        strict = runner.Flags({"MYSTERY": "yes"})
+        with self.assertRaisesRegex(runner.BuildError, "unknown -D flag"):
+            strict.allow({"KNOWN": {}})
+
+    def test_allow_raises_spec_in_help_mode(self):
+        flags = runner.Flags({}, help_mode=True)
+        with self.assertRaises(runner.AllowSpec) as caught:
+            flags.allow({"OPT": {"descr": "option", "default": "off"}})
+        self.assertEqual(
+            caught.exception.spec,
+            {"OPT": {"descr": "option", "default": "off"}},
+        )
 
 
 if __name__ == "__main__":

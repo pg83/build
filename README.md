@@ -134,6 +134,33 @@ roots, public flags from dependencies, then target-local flags. For linking it
 is global linker flags, dependency linker flags, then target-local linker
 flags.
 
+## Build flags
+
+`./build -DNAME=value` passes ad-hoc flags to `build.py`, readable as
+`build.flags`:
+
+```python
+import build
+
+build.flags.allow({
+    "LTO": {"descr": "enable link-time optimization", "default": "no"},
+    "SANITIZER": {"descr": "address, thread, or undefined"},
+})
+
+if build.flags.LTO == "yes":
+    build.cflags += ["-flto"]
+    build.ldflags += ["-flto"]
+if build.flags.SANITIZER:
+    build.cflags += [f"-fsanitize={build.flags.SANITIZER}"]
+```
+
+An unset flag reads as the empty string, so `if build.flags.X:` is a plain
+truthiness test. A bare `-DNAME` sets the flag to `"yes"`.
+
+`allow()` declares the accepted flags. A `-D` outside the declared set is an
+error, and an unset declared flag reads as its default. `./build -h` loads
+`build.py` and lists the declared flags with their descriptions and defaults.
+
 ## Targets
 
 Targets can have an explicit `name=`. Otherwise a non-interface target must be
@@ -291,7 +318,10 @@ roots.
 ## Cache and execution model
 
 Each node UID is MD5 over its canonical command description, dependency UIDs,
-and the names and MD5 hashes of source inputs. Nodes run in parallel once their
+and the names and MD5 hashes of source inputs. A command tool named without a
+path is resolved through `PATH` to its real path before UID calculation, so
+switching toolchains changes node UIDs instead of silently reusing artifacts
+built by another toolchain. Nodes run in parallel once their
 dependencies are ready. Produced files are stored in a SHA-256-addressed CAS
 and restored into the build root as symlinks. A failed command never publishes
 a manifest.
@@ -311,6 +341,8 @@ worker process group, including subprocesses started by commands.
 
   -B, --build-dir DIR   build root; default .build or environment variable B
   -j, --jobs N          parallel worker count; default CPU count
+  -D KEY[=VALUE]        build flag readable in build.py as build.flags.KEY
+  -h, --help            show usage and the build's declared -D flags
   -k, --keep-going      continue independent work after a failed node
   -v, --verbose         print cache hits and command starts
   -T, --ninja           repaint one progress line on a terminal
