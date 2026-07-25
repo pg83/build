@@ -118,12 +118,25 @@ functionCall(
   If the class is declared in an anonymous namespace, close that namespace
   before its qualified method definitions.
 - Avoid heavyweight includes in headers when a forward declaration suffices.
-- A `.cpp` file includes its own header first, then related project headers,
-  then third-party and system headers. Preserve meaningful blank groups; do
-  not sort includes mechanically.
+- Includes go from the least general to the most general, one blank line
+  between groups: the paired header first, then project headers, then
+  `<std/...>`, then third-party and system headers. Within a group, shorter
+  paths come first. `style.py` rewrites the leading include block into this
+  order; includes behind preprocessor conditionals stay where they are.
 - File-local declarations belong in an anonymous namespace. Shared program
   declarations live in the global namespace.
 - Avoid non-trivial global objects. Make ownership and lifetime explicit.
+
+## Errors and client input
+
+- `STD_VERIFY` and `VK_CHECK` throw, and the only catch is around the whole
+  event loop: a failure there ends the session. Use them for our own
+  invariants only — startup, compositor-sized resources, state we created.
+- An allocation or GPU object sized by client input never goes through a
+  throwing macro. Check the result in place and degrade: cap the size before
+  allocating, skip the content with a log line, or disconnect the offending
+  client (`wl_client_post_no_memory`). A client must not be able to reach the
+  top-level catch.
 
 ## Comments and formatting
 
