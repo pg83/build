@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 SOURCE_PATTERNS = ("*.cpp", "*.h")
 INITIALIZER_LIST = re.compile(r"^(?P<indent> +):(?=\s)")
+INCLUDE = re.compile(r'^#include\s+(?P<open>["<])(?P<path>[^">]+)[">]\s*(?P<tail>//.*)?$')
 
 
 def source_files(arguments):
@@ -136,11 +137,75 @@ def restore_constructor_braces(path):
         path.write_text("".join(lines))
 
 
+def reorder_includes(path):
+    """Rewrite the leading include block into the canonical order: the
+    paired header, project headers, <std/...>, then everything else — least
+    general to most general, each group sorted, one blank line between
+    groups. Only the unconditional run at the top of the file is touched;
+    the first comment, conditional or code line ends it, so #ifdef'd
+    includes and order-sensitive tails stay where they are."""
+    text = path.read_text()
+    lines = text.splitlines(keepends=True)
+
+    pragma = []
+    includes = []
+    end = 0
+    for line_number, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            end = line_number + 1
+            continue
+        if stripped == "#pragma once" and not includes:
+            pragma.append(line)
+            end = line_number + 1
+            continue
+        match = INCLUDE.match(stripped)
+        if match is None:
+            break
+        includes.append((match.group("open"), match.group("path"), line))
+        end = line_number + 1
+
+    if not includes:
+        return
+
+    paired = path.stem + ".h"
+    groups = ([], [], [], [])
+    for open_char, include_path, line in includes:
+        if open_char == '"' and include_path == paired and path.suffix != ".h":
+            group = 0
+        elif open_char == '"':
+            group = 1
+        elif include_path.startswith("std/"):
+            group = 2
+        else:
+            group = 3
+        groups[group].append((include_path, line.rstrip("\n").rstrip("\r")))
+
+    newline = "\r\n" if lines[0].endswith("\r\n") else "\n"
+    block = "".join(pragma)
+    if pragma:
+        block += newline
+    parts = []
+    for group in groups:
+        if group:
+            ordered = sorted(group, key=lambda entry: (len(entry[0]), entry[0]))
+            parts.append(newline.join(line for _, line in ordered) + newline)
+    block += newline.join(parts)
+
+    rest = "".join(lines[end:])
+    replacement = block + newline + rest if rest.strip() else block
+    if replacement != text:
+        path.write_text(replacement)
+
+
 def main():
     files = source_files(sys.argv[1:])
     if not files:
         return
 
+    for path in files:
+        if "third_party" not in path.parts:
+            reorder_includes(path)
     format_sources(files)
     for path in files:
         restore_constructor_braces(path)
