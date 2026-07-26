@@ -44,7 +44,7 @@ version_header = command(
         "$(S)/VERSION",
         "$(B)/generated/project/version.h",
     ],
-    descr="GEN",
+    descr="GN",
     color="magenta",
 )
 
@@ -58,27 +58,28 @@ app = program(
     deps=[core, threads],
 )
 
-install(app)
+group("install", app)
 ```
 
 If a source includes `<project/version.h>`, the include scanner finds the
 matching `$(B)/generated/project/version.h` output and adds `version_header` as
 a dependency automatically.
 
-Run the default targets registered by `install()`:
+Run the default `install` group:
 
 ```sh
 ./build
 ```
 
-Or request named targets explicitly:
+Or request a named target or group explicitly:
 
 ```sh
 ./build app
 ```
 
 An explicit CLI target is also published as a relative symlink in the source
-root. In this example `./app` points to `.build/app`. The runner replaces an
+root. In this example `./app` points to `.build/app`. Selecting a group builds
+its members without publishing them individually. The runner replaces an
 existing symlink atomically but never replaces a regular source file or
 directory. Add published target names to the project's `.gitignore`.
 
@@ -272,7 +273,7 @@ command(
     cxxflags=(),
     cppflags=(),
     ldflags=(),
-    descr="GEN",
+    descr="GN",
     color="yellow",
 )
 ```
@@ -284,19 +285,26 @@ path must be declared in `outputs`. `deps` adds target dependencies. `cwd` and
 all `env` values may contain `$(S)` and `$(B)`.
 
 The optional flag arguments are public usage requirements for consumers of the
-command target. `descr` is the short progress label and `color` is one of
-`red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, or their
-`light-*` variants.
+command target. `descr` is the progress label and must contain exactly two
+ASCII letters. `color` is one of `red`, `green`, `yellow`, `blue`, `magenta`,
+`cyan`, `white`, or their `light-*` variants.
 
-### `install()`
+### `group()`
 
 ```python
-install(app, test_runner)
+group("install", app)
+group("test", unit_tests)
+group("test", integration_tests)
 ```
 
-Registers the targets built when the CLI has no positional target names. It
-does not publish source-root symlinks; those are created only for explicit CLI
-targets.
+Defines a CLI alias for a set of targets. Calling `group()` repeatedly with the
+same name adds targets to the existing group. Group names are included in
+`--list`. Selecting a group does not publish source-root symlinks for its
+members.
+
+The `install` group is selected when the CLI has no positional names.
+`install(*targets)` remains available as shorthand for
+`group("install", *targets)`.
 
 ## Include scanning and dependency inference
 
@@ -347,7 +355,7 @@ worker process group, including subprocesses started by commands.
   -v, --verbose         print cache hits and command starts
   -T, --ninja           repaint one progress line on a terminal
       --clear           clear CAS, UID, temporary, and garbage directories
-      --list            list named targets without building
+      --list            list named targets and groups without building
 ```
 
 Default progress output keeps one line per completed node. `--ninja` uses an

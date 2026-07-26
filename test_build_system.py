@@ -194,6 +194,15 @@ class BuildSystemTest(unittest.TestCase):
         self.assertEqual((program.root.descr, program.root.color), ("LD", "light-blue"))
         self.assertEqual((generated.root.descr, generated.root.color), ("PB", "light-cyan"))
 
+    def test_node_description_is_exactly_two_ascii_letters(self):
+        for descr in ("A", "ABC", "A1", "A ", "ÄB"):
+            with self.subTest(descr=descr):
+                with self.assertRaisesRegex(
+                    runner.BuildError,
+                    "descr must be exactly two ASCII letters",
+                ):
+                    runner.Node([], [], [], descr=descr)
+
     def test_scans_transitive_project_and_generated_includes(self):
         (self.root / "main.cpp").write_text(
             '#include <api/public.h>\n#include <generated.h>\nint main() {}\n',
@@ -426,6 +435,67 @@ class BuildSystemTest(unittest.TestCase):
             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         self.assertFalse(published.exists())
+
+    def test_groups_are_additive_cli_aliases(self):
+        project = self.root / "project"
+        project.mkdir()
+        shutil.copy2(ROOT / "build", project / "build")
+        (project / "build.py").write_text(
+            "one = command(outputs=['$(B)/one'],\n"
+            "    cmd=['python3', '-c',\n"
+            "         \"from pathlib import Path; Path(r'$(B)/one').touch()\"])\n"
+            "two = command(outputs=['$(B)/two'],\n"
+            "    cmd=['python3', '-c',\n"
+            "         \"from pathlib import Path; Path(r'$(B)/two').touch()\"])\n"
+            "group('batch', one)\n"
+            "group('batch', two)\n"
+            "group('install', one)\n",
+        )
+
+        listed = subprocess.run(
+            [str(project / "build"), "--list"], cwd=project,
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.assertEqual(
+            listed.stdout.splitlines(),
+            ["batch", "install", "one", "two"],
+        )
+
+        subprocess.run(
+            [str(project / "build"), "batch"], cwd=project,
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.assertTrue((project / ".build" / "one").exists())
+        self.assertTrue((project / ".build" / "two").exists())
+        self.assertFalse((project / "one").exists())
+        self.assertFalse((project / "two").exists())
+
+    def test_install_group_is_default_and_install_is_compatible(self):
+        context = self.context()
+        first = context.command(
+            name="first", outputs=["$(B)/first"], cmd=[["true"]],
+        )
+        second = context.command(
+            name="second", outputs=["$(B)/second"], cmd=[["true"]],
+        )
+
+        context.group("install", first)
+        context.install(second)
+
+        self.assertEqual(context.groups["install"], [first, second])
+
+    def test_group_name_cannot_conflict_with_target_name(self):
+        (self.root / "build.py").write_text(
+            "same = command(outputs=['$(B)/same'], cmd=['true'])\n"
+            "group('same', same)\n",
+        )
+        context = self.context()
+
+        with self.assertRaisesRegex(
+            runner.BuildError,
+            "group name conflicts with target name: same",
+        ):
+            context.load(self.root / "build.py")
 
     def test_publish_refuses_to_replace_source_file(self):
         context = self.context()

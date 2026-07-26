@@ -172,6 +172,11 @@ def _cwd_path(path: str) -> str:
     raise BuildError(f"cwd path must start with $(S)/ or $(B)/: {path}")
 
 
+def _validate_descr(descr: str) -> None:
+    if len(descr) != 2 or not descr.isascii() or not descr.isalpha():
+        raise BuildError(f"descr must be exactly two ASCII letters: {descr!r}")
+
+
 @dataclasses.dataclass(eq=False)
 class Node:
     inputs: list[str]
@@ -180,12 +185,15 @@ class Node:
     deps: list["Node"] = dataclasses.field(default_factory=list)
     cwd: str = B
     env: dict[str, str] = dataclasses.field(default_factory=dict)
-    descr: str = "CMD"
+    descr: str = "GN"
     color: str = ""
     include_roots: list[str] = dataclasses.field(default_factory=list)
     scan_sources: bool = False
     source_inputs: set[str] = dataclasses.field(default_factory=set)
     uid: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_descr(self.descr)
 
     def canonical(self) -> dict[str, Any]:
         return {
@@ -234,7 +242,7 @@ class BuildContext:
         self.build_root = build_root.resolve()
         self.flags = flags if flags is not None else Flags({})
         self.targets: list[Target] = []
-        self.installed: list[Target] = []
+        self.groups: dict[str, list[Target]] = {}
         self.nodes: list[Node] = []
         self.output_nodes: dict[str, Node] = {}
         self.target_names: dict[str, Target] = {}
@@ -351,7 +359,7 @@ class BuildContext:
         return target
 
     def command(self, *, inputs=(), outputs, cmd, deps=(), name=None, cwd=B, env=None,
-                cflags=(), cxxflags=(), cppflags=(), ldflags=(), descr="GEN", color="yellow") -> Target:
+                cflags=(), cxxflags=(), cppflags=(), ldflags=(), descr="GN", color="yellow") -> Target:
         commands = cmd
         if not commands or isinstance(commands[0], (str, bytes)):
             commands = [commands]
@@ -368,11 +376,16 @@ class BuildContext:
         self.targets.append(target)
         return target
 
-    def install(self, *targets: Target) -> None:
+    def group(self, name: str, *targets: Target) -> None:
+        if not isinstance(name, str) or not name:
+            raise BuildError(f"group name must be a non-empty string, got {name!r}")
         for target in targets:
             if not isinstance(target, Target):
-                raise BuildError(f"install expects targets, got {target!r}")
-            self.installed.append(target)
+                raise BuildError(f"group {name!r} expects targets, got {target!r}")
+        self.groups.setdefault(name, []).extend(targets)
+
+    def install(self, *targets: Target) -> None:
+        self.group("install", *targets)
 
     @staticmethod
     def _validate_deps(target: Target) -> None:
@@ -399,6 +412,7 @@ class BuildContext:
             "library": self.library,
             "program": self.program,
             "command": self.command,
+            "group": self.group,
             "install": self.install,
         })
         sys.modules[spec.name] = module
@@ -506,7 +520,7 @@ class BuildContext:
             node = Node(
                 inputs=[], outputs=outputs, commands=commands,
                 cwd=cwd, env=env,
-                descr=str(record.get("descr", "IMP")),
+                descr=str(record.get("descr", "GN")),
                 color=str(record.get("color", "yellow")),
             )
             nodes.append(node)
@@ -580,7 +594,7 @@ class BuildContext:
                 record["cwd"] = node.cwd
             if node.env:
                 record["env"] = node.env
-            if node.descr != "CMD":
+            if node.descr != "GN":
                 record["descr"] = node.descr
             if node.color:
                 record["color"] = node.color
@@ -615,6 +629,9 @@ class BuildContext:
             if previous is not None and previous is not target:
                 raise BuildError(f"duplicate target name: {target.name}")
             self.target_names[target.name] = target
+        for name in self.groups:
+            if name in self.target_names:
+                raise BuildError(f"group name conflicts with target name: {name}")
 
     def build_graph(self) -> None:
         for target in self.targets:
@@ -1176,7 +1193,7 @@ class Executor:
         assert node.uid is not None
         if self._cached(node.uid):
             if self.verbose:
-                self._report(f"HIT  {node.descr:3} {self._node_name(node)}")
+                self._report(f"HIT  {node.descr} {self._node_name(node)}")
             return
         if not expected_miss:
             with self.print_lock:
@@ -1195,7 +1212,7 @@ class Executor:
             for output in node.outputs:
                 self.context.physical(output, work).parent.mkdir(parents=True, exist_ok=True)
             if self.verbose:
-                self._report(f"RUN  {node.descr:3} {self._node_name(node)}")
+                self._report(f"RUN  {node.descr} {self._node_name(node)}")
             for command in node.commands:
                 self._run_command(node, command, work)
             self._store(node, work)
@@ -1493,20 +1510,27 @@ def main(argv: list[str] | None = None) -> int:
             print(context.serialize_graph())
             return 0
         if args.list:
-            for name in sorted(context.target_names):
+            for name in sorted(context.target_names.keys() | context.groups.keys()):
                 print(name)
             return 0
+        publish: list[Target] = []
         if args.targets:
             selected: list[Target] = []
             for name in args.targets:
                 target = context.target_names.get(name)
-                if target is None:
-                    raise BuildError(f"unknown target: {name}")
-                selected.append(target)
+                if target is not None:
+                    selected.append(target)
+                    publish.append(target)
+                    continue
+                targets = context.groups.get(name)
+                if targets is None:
+                    raise BuildError(f"unknown target or group: {name}")
+                selected.extend(targets)
         else:
-            selected = context.installed
+            selected = context.groups.get("install", [])
             if not selected:
-                raise BuildError("no targets requested and build.py installed no defaults")
+                raise BuildError("no targets requested and build.py defined no install group")
+        selected = _uniq(selected)
         roots = _uniq(target.root for target in selected if target.root is not None)
         context.calculate_uids(roots)
         if args.clear:
@@ -1514,8 +1538,8 @@ def main(argv: list[str] | None = None) -> int:
                 shutil.rmtree(context.build_root / directory, ignore_errors=True)
         context.build_root.mkdir(parents=True, exist_ok=True)
         Executor(context, args.jobs, args.verbose, args.keep_going, args.ninja).run(roots)
-        if args.targets:
-            context.publish(selected)
+        if publish:
+            context.publish(publish)
         return 0
     except BuildError as exc:
         print(f"build: {exc}", file=sys.stderr)
