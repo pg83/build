@@ -516,6 +516,8 @@ class BuildContext:
 
     def load(self, path: Path) -> Any:
         self.build_file = path.resolve()
+        if not self.build_file.is_file():
+            raise BuildError(f"build file does not exist: {self.build_file}")
         spec = importlib.util.spec_from_file_location("_project_build", path)
         if spec is None or spec.loader is None:
             raise BuildError(f"cannot load {path}")

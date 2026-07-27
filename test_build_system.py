@@ -869,6 +869,25 @@ class BuildSystemTest(unittest.TestCase):
         self.assertIn("enable lto", result.stdout)
         self.assertIn("(default: no)", result.stdout)
 
+    def test_cli_reports_missing_build_file_without_traceback(self):
+        project = self.root / "project"
+        project.mkdir()
+        shutil.copy2(ROOT / "build", project / "build")
+
+        result = subprocess.run(
+            [str(project / "build")],
+            cwd=project,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(
+            result.stderr,
+            f"build: build file does not exist: {project / 'build.py'}\n",
+        )
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_parser_ignores_commented_directives(self):
         source = self.root / "source.c"
         source.write_text(
