@@ -130,6 +130,10 @@ The flag lists initially contain shell-parsed environment values:
 `CC`, `CXX`, `AR`, and `PKG_CONFIG` select the corresponding tools. Per-target
 flags extend the global flags and are placed later on the command line.
 
+`build.host` is the current platform triple and `build.target` is the requested
+target triple. They are equal unless `--target` was passed or the graph was
+loaded by a cross-compiling `import_build()`.
+
 For compilation the order is global preprocessor/language flags, global include
 roots, public flags from dependencies, then target-local flags. For linking it
 is global linker flags, dependency linker flags, then target-local linker
@@ -161,6 +165,33 @@ truthiness test. A bare `-DNAME` sets the flag to `"yes"`.
 `allow()` declares the accepted flags. A `-D` outside the declared set is an
 error, and an unset declared flag reads as its default. `./build -h` loads
 `build.py` and lists the declared flags with their descriptions and defaults.
+
+## Cross-compilation
+
+Pass a Clang-compatible target triple with `--target`:
+
+```sh
+./build --target aarch64-unknown-linux-gnu
+```
+
+Every generated Clang compile and link command contains
+`--target=<build.target>`, including native builds. GCC commands receive no
+target option; selecting GCC when `build.host != build.target` is a
+configuration error.
+
+A `program()` output used as an exact `$(B)` argument in a custom command's
+`inputs` or `cmd` is a host tool. When the host and target configurations
+differ, the runner loads the same `build.py` recursively for `build.host`,
+imports the host program's transitive node closure, and uses that program
+instead of producing a target variant. Host and target nodes retain the same
+symbolic output paths; their isolated UID work directories keep the artifacts
+separate.
+
+The host configuration does not inherit CLI `-D` flags. Shell-parsed
+`HOST_CPPFLAGS`, `HOST_CFLAGS`, and `HOST_CXXFLAGS` are appended to host
+compiles. Configuration identity includes the target triple, `-D` values, and
+these imported extra flags, so a native build reuses the current graph only
+when the configurations really match.
 
 ## Targets
 
@@ -254,6 +285,23 @@ dependency(
 Creates an interface-only target. It has no commands or outputs and carries
 usage requirements to consumers. This is useful for dependencies described
 directly in `build.py`.
+
+### `import_build()`
+
+```python
+import_build(
+    path,
+    output_name,
+    extra_cflags=(),
+    extra_cxxflags=(),
+    extra_cppflags=(),
+)
+```
+
+Loads another source-tree `build.py`, imports the transitive closure of the
+export whose filename is `output_name`, and returns it as a target. The child
+graph inherits `build.target` and the optional language-specific extra flags,
+but it does not inherit CLI `-D` flags.
 
 ### `pkg_config()`
 
@@ -364,6 +412,7 @@ worker process group, including subprocesses started by commands.
 ./build [options] [targets...]
 
   -B, --build-dir DIR   build root; default .build or environment variable B
+      --target TRIPLE   target triple; default is the current host platform
   -j, --jobs N          parallel worker count; default CPU count
   -D KEY[=VALUE]        build flag readable in build.py as build.flags.KEY
   -h, --help            show usage and the build's declared -D flags

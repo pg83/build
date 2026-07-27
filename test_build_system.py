@@ -4,6 +4,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import shutil
 import signal
@@ -40,10 +41,17 @@ class BuildSystemTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {}, clear=True):
             args = runner.parse_args([])
             self.assertEqual(args.build_dir, ".build")
+            self.assertIsNone(args.target)
             self.assertFalse(args.ninja)
+        self.assertEqual(
+            runner.parse_args(["--target", "aarch64-unknown-linux-gnu"]).target,
+            "aarch64-unknown-linux-gnu",
+        )
         self.assertTrue(runner.parse_args(["--ninja"]).ninja)
         self.assertTrue(runner.parse_args(["-T"]).ninja)
-        executor = runner.Executor(self.context(), 1, False, False)
+        context = self.context()
+        self.assertEqual(context.target, context.host)
+        executor = runner.Executor(context, 1, False, False)
         self.assertEqual(executor.cas, self.out / "cas")
         self.assertEqual(executor.uids, self.out / "uid")
         self.assertEqual(executor.tmp, self.out / "tmp")
@@ -155,17 +163,204 @@ class BuildSystemTest(unittest.TestCase):
         cxx_command = app.nodes[1].commands[0]
         self.assertEqual(
             c_command[1:c_command.index("-c")],
-            ["-I$(S)", "-global-cpp", "-global-c", "-dep-cpp", "-dep-c", "-local-cpp", "-local-c"],
+            [
+                f"--target={context.target}",
+                "-I$(S)", "-global-cpp", "-global-c", "-dep-cpp", "-dep-c",
+                "-local-cpp", "-local-c",
+            ],
         )
         self.assertEqual(
             cxx_command[1:cxx_command.index("-c")],
             [
+                f"--target={context.target}",
                 "-I$(S)", "-global-cpp", "-global-c", "-global-cxx",
                 "-dep-cpp", "-dep-c", "-dep-cxx",
                 "-local-cpp", "-local-c", "-local-cxx",
             ],
         )
         self.assertEqual(app.root.commands[0][-3:], ["-global-ld", "-dep-ld", "-local-ld"])
+
+    def test_clang_always_receives_target_and_gcc_cannot_cross_compile(self):
+        (self.root / "main.c").write_text("int main(void) { return 0; }\n")
+        cross = self.context()
+        cross.target = "aarch64-unknown-linux-gnu"
+        app = cross.program(name="app", srcs=["$(S)/main.c"])
+        cross.build_graph()
+        self.assertEqual(
+            app.nodes[0].commands[0][1],
+            "--target=aarch64-unknown-linux-gnu",
+        )
+        self.assertEqual(
+            app.root.commands[0][1],
+            "--target=aarch64-unknown-linux-gnu",
+        )
+
+        gcc = runner.BuildContext(
+            self.root,
+            self.out,
+            target="aarch64-unknown-linux-gnu",
+            host="x86_64-unknown-linux-gnu",
+        )
+        gcc.cc = "gcc"
+        gcc.program(name="gcc_app", srcs=["$(S)/main.c"])
+        with mock.patch.object(gcc, "_compiler_kind", return_value="gcc"):
+            with self.assertRaisesRegex(
+                runner.BuildError,
+                "GCC cross-compilation is not supported",
+            ):
+                gcc.build_graph()
+
+        native_gcc = runner.BuildContext(
+            self.root,
+            self.out,
+            host="x86_64-unknown-linux-gnu",
+            target="x86_64-unknown-linux-gnu",
+        )
+        native_gcc.cc = "gcc"
+        native_app = native_gcc.program(
+            name="native_gcc_app",
+            srcs=["$(S)/main.c"],
+        )
+        with mock.patch.object(native_gcc, "_compiler_kind", return_value="gcc"):
+            native_gcc.build_graph()
+        self.assertEqual(native_app.nodes[0].commands[0][0], "gcc")
+        self.assertNotIn("--target", native_app.nodes[0].commands[0])
+
+    def test_cross_graph_imports_host_program_without_target_variant(self):
+        project = self.root / "project"
+        project.mkdir()
+        (project / "support.c").write_text("int support(void) { return 0; }\n")
+        (project / "tool.cpp").write_text("int main() { return 0; }\n")
+        (project / "app.c").write_text("int main(void) { return 0; }\n")
+        (project / "build.py").write_text(
+            "import build\n"
+            "build.flags.allow({'FLAVOR': {'default': 'host'}})\n"
+            "support = library(\n"
+            "    srcs=['$(S)/support.c'],\n"
+            "    cflags=['-DFLAVOR=' + build.flags.FLAVOR],\n"
+            ")\n"
+            "tool = program(srcs=['$(S)/tool.cpp'], deps=[support])\n"
+            "generated = command(\n"
+            "    inputs=['$(B)/tool'],\n"
+            "    outputs=['$(B)/generated'],\n"
+            "    cmd=['$(B)/tool', '$(B)/generated'],\n"
+            ")\n"
+            "generated_again = command(\n"
+            "    outputs=['$(B)/generated-again'],\n"
+            "    cmd=['$(B)/tool', '$(B)/generated-again'],\n"
+            ")\n"
+            "app = program(srcs=['$(S)/app.c'], deps=[support, generated, generated_again])\n"
+            "install(app, generated, generated_again)\n",
+        )
+        environment = {
+            "HOST_CFLAGS": "-host-c",
+            "HOST_CXXFLAGS": "-host-cxx",
+            "HOST_CPPFLAGS": "-host-cpp",
+        }
+        with mock.patch.dict("os.environ", environment, clear=False):
+            context = runner.BuildContext(
+                project,
+                self.out,
+                runner.Flags({"FLAVOR": "target"}),
+                target="aarch64-unknown-linux-gnu",
+            )
+            context.load(project / "build.py")
+            with mock.patch.object(
+                runner.subprocess,
+                "run",
+                wraps=subprocess.run,
+            ) as run:
+                context.build_graph()
+                context.build_graph()
+            self.assertEqual(run.call_count, 1)
+
+        tool = context.target_names["tool"]
+        generated = context.target_names["generated"]
+        generated_again = context.target_names["generated_again"]
+        support = context.target_names["support"]
+        app = context.target_names["app"]
+        self.assertIn(tool.root, generated.root.deps)
+        self.assertIn(tool.root, generated_again.root.deps)
+
+        tool_compiles = [
+            node for node in context.nodes
+            if node.outputs and node.outputs[0].startswith("$(B)/obj/tool/")
+        ]
+        self.assertEqual(len(tool_compiles), 1)
+        tool_command = tool_compiles[0].commands[0]
+        self.assertIn(f"--target={context.host}", tool_command)
+        self.assertNotIn("--target=aarch64-unknown-linux-gnu", tool_command)
+        self.assertIn("-host-c", tool_command)
+        self.assertIn("-host-cxx", tool_command)
+        self.assertIn("-host-cpp", tool_command)
+
+        support_compiles = [
+            node for node in context.nodes
+            if node.outputs and node.outputs[0].startswith("$(B)/obj/support/")
+        ]
+        self.assertEqual(len(support_compiles), 2)
+        commands = [node.commands[0] for node in support_compiles]
+        self.assertTrue(any("-DFLAVOR=host" in command for command in commands))
+        self.assertTrue(any("-DFLAVOR=target" in command for command in commands))
+        self.assertIs(context.output_nodes["$(B)/libsupport.a"], support.root)
+        self.assertIn("--target=aarch64-unknown-linux-gnu", app.nodes[0].commands[0])
+
+        graph = json.loads(context.serialize_graph())
+        self.assertEqual(graph["version"], 2)
+        support_archives = [
+            record for record in graph["nodes"]
+            if record["outputs"] == ["$(B)/libsupport.a"]
+        ]
+        self.assertEqual(len(support_archives), 2)
+        decoded, _primary, exports = runner.BuildContext._decode_graph(
+            graph,
+            project / "build.py",
+        )
+        decoded_app, kind = runner.BuildContext._select_imported_root(
+            decoded,
+            exports,
+            "$(B)/app",
+            exact=True,
+            target_name="app",
+        )
+        self.assertEqual(kind, "program")
+        decoded_closure = runner.BuildContext._node_closure([decoded_app])
+        self.assertEqual(
+            len([
+                node for node in decoded_closure
+                if node.outputs == ["$(B)/libsupport.a"]
+            ]),
+            2,
+        )
+
+    def test_cross_host_program_executes_inside_custom_command(self):
+        project = self.root / "execute-host"
+        project.mkdir()
+        (project / "tool.c").write_text(
+            "int main(void) { return 0; }\n",
+        )
+        (project / "build.py").write_text(
+            "tool = program(srcs=['$(S)/tool.c'])\n"
+            "generated = command(\n"
+            "    outputs=['$(B)/generated'],\n"
+            "    cmd=['python3', '-c',\n"
+            "         \"from pathlib import Path; import sys; assert Path(sys.argv[1]).is_file(); Path(sys.argv[2]).write_text('host-ok')\",\n"
+            "         '$(B)/tool', '$(B)/generated'],\n"
+            ")\n"
+            "install(generated)\n",
+        )
+        context = runner.BuildContext(
+            project,
+            self.out,
+            target="aarch64-unknown-linux-gnu",
+        )
+        context.load(project / "build.py")
+        context.build_graph()
+        generated = context.target_names["generated"]
+        context.calculate_uids([generated.root])
+        with contextlib.redirect_stderr(io.StringIO()):
+            runner.Executor(context, 2, False, False).run([generated.root])
+        self.assertEqual((self.out / "generated").read_text(), "host-ok")
 
     def test_project_includes_precede_environment_dependencies(self):
         (self.root / "main.cpp").write_text("int main() {}\n")
@@ -177,6 +372,79 @@ class BuildSystemTest(unittest.TestCase):
         command = app.nodes[0].commands[0]
         self.assertLess(command.index("-I$(S)"),
                         command.index("-I/external/dependency"))
+
+    def test_import_build_inherits_target_and_language_specific_extra_flags(self):
+        project = self.root / "project"
+        child = project / "child"
+        child.mkdir(parents=True)
+        (project / "main.c").write_text("int main(void) { return 0; }\n")
+        (child / "child.cpp").write_text("int child() { return 0; }\n")
+        (child / "build.py").write_text(
+            "import build\n"
+            "build.flags.allow({'MODE': {'default': 'child'}})\n"
+            "child = library(\n"
+            "    srcs=['$(S)/child.cpp'],\n"
+            "    cppflags=['-DMODE=' + build.flags.MODE],\n"
+            ")\n",
+        )
+        (project / "build.py").write_text(
+            "import build\n"
+            "build.flags.allow({'MODE': {'default': 'parent'}})\n"
+            "child = import_build(\n"
+            "    'child/build.py',\n"
+            "    'libchild.a',\n"
+            "    extra_cflags=['-import-c'],\n"
+            "    extra_cxxflags=['-import-cxx'],\n"
+            "    extra_cppflags=['-import-cpp'],\n"
+            ")\n"
+            "app = program(srcs=['$(S)/main.c'], deps=[child])\n",
+        )
+
+        context = runner.BuildContext(
+            project,
+            self.out,
+            runner.Flags({"MODE": "parent-cli"}),
+            target="aarch64-unknown-linux-gnu",
+        )
+        context.load(project / "build.py")
+        context.build_graph()
+        imported = context.target_names["child"]
+        compile_node = next(
+            node for node in imported.nodes
+            if node.outputs and "/obj/child/" in node.outputs[0]
+        )
+        command = compile_node.commands[0]
+        self.assertIn("--target=aarch64-unknown-linux-gnu", command)
+        self.assertIn("-import-c", command)
+        self.assertIn("-import-cxx", command)
+        self.assertIn("-import-cpp", command)
+        self.assertIn("-DMODE=child", command)
+        self.assertNotIn("-DMODE=parent-cli", command)
+
+    def test_import_build_caches_one_graph_for_multiple_outputs(self):
+        project = self.root / "multi-import"
+        child = project / "child"
+        child.mkdir(parents=True)
+        (child / "one.c").write_text("int one;\n")
+        (child / "two.c").write_text("int two;\n")
+        (child / "build.py").write_text(
+            "one = library(srcs=['$(S)/one.c'])\n"
+            "two = library(srcs=['$(S)/two.c'])\n",
+        )
+        context = runner.BuildContext(project, self.out)
+        with mock.patch.object(
+            runner.subprocess,
+            "run",
+            wraps=subprocess.run,
+        ) as run:
+            one = context.import_build("child/build.py", "libone.a")
+            two = context.import_build("child/build.py", "libtwo.a")
+        self.assertEqual(run.call_count, 1)
+        self.assertNotEqual(one.root, two.root)
+        self.assertEqual(
+            {one.root.outputs[0], two.root.outputs[0]},
+            {"$(B)/child/libone.a", "$(B)/child/libtwo.a"},
+        )
 
     def test_node_descriptions_and_colors(self):
         (self.root / "thing.cpp").write_text("int thing;\n")
