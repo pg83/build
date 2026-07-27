@@ -230,6 +230,30 @@ class BuildSystemTest(unittest.TestCase):
         )
         self.assertIn(generated.root, compile_node.deps)
 
+    def test_source_mapping_adds_inputs_to_one_compile_node(self):
+        (self.root / "main.cpp").write_text("int main() {}\n")
+        (self.root / "other.cpp").write_text("int other;\n")
+        context = self.context()
+        generated = context.command(
+            name="generated",
+            outputs=["$(B)/generated.h"],
+            cmd=[[sys.executable, "-c", "pass"]],
+        )
+        app = context.program(
+            name="app",
+            srcs=[
+                {
+                    "src": "$(S)/main.cpp",
+                    "inputs": ["$(B)/generated.h"],
+                },
+                "$(S)/other.cpp",
+            ],
+        )
+        context.build_graph()
+
+        self.assertIn(generated.root, app.nodes[0].deps)
+        self.assertNotIn(generated.root, app.nodes[1].deps)
+
     def test_include_roots_are_reverse_indexed_with_one_walk_each(self):
         (self.root / "src").mkdir()
         (self.root / "src/main.cpp").write_text(

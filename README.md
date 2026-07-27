@@ -199,6 +199,22 @@ override it with another `$(B)/...` path. The C++ linker is selected if the
 target or one of its target dependencies contains C++ sources; `linker` can
 override that choice.
 
+An entry in `srcs` may be a mapping when one compile node needs additional
+inputs:
+
+```python
+srcs=[
+    {
+        "src": "$(S)/parser.cpp",
+        "inputs": ["$(B)/parser.rl.h"],
+    },
+]
+```
+
+A declared `$(B)` input is replaced with a dependency on its producer. Source
+inputs are hashed directly. Other sources in the target do not inherit these
+inputs.
+
 ### `library()`
 
 ```python

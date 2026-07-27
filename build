@@ -209,7 +209,7 @@ class Node:
 class Target:
     kind: str
     name: str | None = None
-    srcs: list[str] = dataclasses.field(default_factory=list)
+    srcs: list[Any] = dataclasses.field(default_factory=list)
     deps: list["Target"] = dataclasses.field(default_factory=list)
     cflags: list[str] = dataclasses.field(default_factory=list)
     cxxflags: list[str] = dataclasses.field(default_factory=list)
@@ -344,8 +344,22 @@ class BuildContext:
     def _compiled_target(self, kind, srcs, name, cflags, cxxflags, cppflags,
                          public_cflags, public_cxxflags, public_cppflags,
                          deps, ldflags, output, linker) -> Target:
+        sources = []
+        for source in _items(srcs):
+            if isinstance(source, dict):
+                source = dict(source)
+                if "src" not in source:
+                    raise BuildError("source mapping has no 'src' field")
+                source["src"] = _source_path(source["src"])
+                source["inputs"] = [_source_path(path) for path in _items(source.get("inputs", ()))]
+                unknown = set(source) - {"src", "inputs"}
+                if unknown:
+                    raise BuildError(f"unknown source field(s): {', '.join(sorted(unknown))}")
+                sources.append(source)
+            else:
+                sources.append(_source_path(source))
         target = Target(
-            kind, name=name, srcs=[_source_path(x) for x in _items(srcs)],
+            kind, name=name, srcs=sources,
             deps=_items(deps),
             cflags=_items(cflags), cxxflags=_items(cxxflags), cppflags=_items(cppflags),
             public_cflags=_items(public_cflags),
@@ -679,7 +693,13 @@ class BuildContext:
         include_flags = ["-I" + path for path in global_includes]
         objects: list[Node] = []
         uses_cxx = False
-        for src in target.srcs:
+        for source in target.srcs:
+            if isinstance(source, dict):
+                src = source["src"]
+                source_inputs = source["inputs"]
+            else:
+                src = source
+                source_inputs = []
             ext = Path(src).suffix.lower()
             cxx = ext in (".cc", ".cpp", ".cxx", ".c++")
             uses_cxx |= cxx
@@ -698,19 +718,29 @@ class BuildContext:
             rel = re.sub(r"[^A-Za-z0-9_./+-]", "_", rel)
             obj = f"{B}/obj/{target.name}/{rel}.o"
             deps: list[Node] = []
+            inputs = [src]
+            for source_input in source_inputs:
+                producer = self.output_nodes.get(source_input)
+                if producer is None:
+                    if source_input.startswith(B + "/"):
+                        raise BuildError(f"no producer for generated input {source_input}")
+                    inputs.append(source_input)
+                else:
+                    deps.append(producer)
             if src.startswith(B + "/"):
                 producer = self.output_nodes.get(src)
                 if producer is None:
                     raise BuildError(f"no producer for generated source {src}")
                 deps.append(producer)
             node = Node(
-                inputs=[src], outputs=[obj],
+                inputs=inputs, outputs=[obj],
                 commands=[[compiler, *common, "-c", src, "-o", obj]], deps=deps,
                 descr="CC", color="green", include_roots=include_roots,
                 scan_sources=src.startswith(S + "/") or os.path.isabs(src),
             )
-            if src.startswith(S + "/") or os.path.isabs(src):
-                node.source_inputs.add(src)
+            for source_input in inputs:
+                if source_input.startswith(S + "/") or os.path.isabs(source_input):
+                    node.source_inputs.add(source_input)
             self._add_node(node)
             objects.append(node)
         target.uses_cxx = uses_cxx or any(dep.uses_cxx for dep in target.deps)
