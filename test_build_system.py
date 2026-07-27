@@ -586,6 +586,24 @@ class BuildSystemTest(unittest.TestCase):
         second.calculate_uids([app2.root])
         self.assertNotEqual(uid1, app2.nodes[0].uid)
 
+    def test_scans_transitive_headers_from_absolute_source(self):
+        with tempfile.TemporaryDirectory() as external_name:
+            external = Path(external_name)
+            source = external / "main.cpp"
+            public = external / "public.h"
+            detail = external / "detail.h"
+            source.write_text('#include "public.h"\nint main() {}\n')
+            public.write_text('#include "detail.h"\n')
+            detail.write_text("// detail\n")
+
+            context = self.context()
+            app = context.program(name="app", srcs=[str(source)])
+            context.build_graph()
+            self.assertEqual(
+                app.nodes[0].source_inputs,
+                {str(source), str(public), str(detail)},
+            )
+
     def test_cyclic_headers_have_finite_closure(self):
         (self.root / "main.c").write_text('#include "a.h"\n')
         (self.root / "a.h").write_text('#include "b.h"\n')

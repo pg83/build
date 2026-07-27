@@ -372,9 +372,9 @@ The `install` group is selected when the CLI has no positional names.
 
 ## Include scanning and dependency inference
 
-C and C++ sources below `$(S)` are scanned for quoted and angle-bracket
-`#include` directives. Comments are ignored. Resolution is recursive and
-cached for the duration of the build:
+C and C++ sources below `$(S)`, and sources declared with absolute paths, are
+scanned for quoted and angle-bracket `#include` directives. Comments are
+ignored. Resolution is recursive and cached for the duration of the build:
 
 1. A quoted include is tried relative to the including file.
 2. The source root and every entry in `build.includes` are searched.

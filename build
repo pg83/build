@@ -1356,7 +1356,7 @@ class IncludeScanner:
             self._normal_symbolic(root) for root in (node.include_roots or [S])
         ))
         for source in node.inputs:
-            if not source.startswith(S + "/"):
+            if not (source.startswith(S + "/") or os.path.isabs(source)):
                 continue
             files, producers = self._closure(source, roots, set())
             node.source_inputs.update(files)
@@ -1466,6 +1466,8 @@ class IncludeScanner:
                     return result
             candidate = self._normal_symbolic(directory + "/" + target)
             result = self.paths.get(candidate)
+            if result is None and os.path.isabs(candidate) and Path(candidate).is_file():
+                result = (candidate, None)
             if result is not None:
                 self.resolved[key] = result
                 return result
