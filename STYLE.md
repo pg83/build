@@ -19,7 +19,8 @@ constructor rules below remain part of review.
   `utf8Decoder`, not `HTTPClient`, `IOReactor` or `utf8_decoder`.
 - Source filenames are lowercase `snake_case`. Every `.h` has a corresponding
   `.cpp`, even when that translation unit only includes the header to verify
-  that the header compiles on its own.
+  that the header compiles on its own. Objective-C++ headers may instead have
+  a corresponding `.mm`.
 
 Do not encode scope or type in a name. Prefer a precise noun or verb over a
 prefix such as `m_`, `p_`, `str_` or `is_`.
@@ -110,13 +111,13 @@ functionCall(
 
 - Keep every non-template function longer than one trivial statement out of
   headers. Headers describe interfaces; implementation belongs in the paired
-  `.cpp` file. Templates are the only exception.
+  `.cpp` or `.mm` file. Templates are the only exception.
 - Do not use `.icc` files. Put non-template definitions in the paired `.cpp`
-  and keep template definitions in the header that declares them.
-- A class declared in a `.cpp` file contains declarations only. Define every
-  method out of line, including constructors, destructors and trivial accessors.
-  If the class is declared in an anonymous namespace, close that namespace
-  before its qualified method definitions.
+  or `.mm` and keep template definitions in the header that declares them.
+- A class declared in a `.cpp` or `.mm` file contains declarations only.
+  Define every method out of line, including constructors, destructors and
+  trivial accessors. If the class is declared in an anonymous namespace, close
+  that namespace before its qualified method definitions.
 - Avoid heavyweight includes in headers when a forward declaration suffices.
 - Includes go from the least general to the most general, one blank line
   between groups: the paired header first, then project headers, then
@@ -150,6 +151,6 @@ functionCall(
 - Keep at most one empty line between logical blocks and no empty line at the
   start of a block.
 
-Run `./style.py` to format all tracked C++ sources. Set `CLANG_FORMAT` when the
-binary is not named `clang-format` on `PATH`. Generated files and
-`render.comp` are intentionally excluded.
+Run `./style.py` to format all tracked C++ and Objective-C++ sources. Set
+`CLANG_FORMAT` when the binary is not named `clang-format` on `PATH`.
+Generated files and `render.comp` are intentionally excluded.

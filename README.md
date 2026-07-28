@@ -432,7 +432,7 @@ is redirected.
 Run the self-contained test suite with:
 
 ```sh
-python3 test_build_system.py
+python3 -m unittest
 ```
 
 The `build` file is the distributable artifact. Projects should update their
