@@ -27,6 +27,7 @@ import subprocess
 import sysconfig
 import tempfile
 import threading
+import time
 import types
 import uuid
 from collections import defaultdict, deque
@@ -1083,6 +1084,8 @@ class BuildContext:
         assert target.name is not None
         global_includes = _uniq([S, *[_include_path(path) for path in self.includes]])
         include_flags = ["-I" + path for path in global_includes]
+        usage_cflags = self._usage_compile_flags(target.deps, False)
+        usage_cxxflags = self._usage_compile_flags(target.deps, True)
         objects: list[Node] = []
         uses_cxx = False
         for source in target.srcs:
@@ -1099,7 +1102,7 @@ class BuildContext:
             common = [*include_flags, *self.cppflags, *self.cflags]
             if cxx:
                 common.extend(self.cxxflags)
-            common.extend(self._usage_compile_flags(target.deps, cxx))
+            common.extend(usage_cxxflags if cxx else usage_cflags)
             common.extend(target.cppflags)
             common.extend(target.cflags)
             if cxx:
@@ -1335,7 +1338,17 @@ class BuildContext:
 
 
 class IncludeScanner:
-    directive = re.compile(r'^\s*#\s*(?:include|import)\s*([<"])([^>"]+)[>"]')
+    directive = re.compile(
+        r'^[^\S\r\n]*#[^\S\r\n]*(?:include|import)[^\S\r\n]*'
+        r'([<"])([^>"]+)[>"]',
+        re.MULTILINE,
+    )
+    comment_or_literal = re.compile(
+        r'//[^\n]*|/\*.*?(?:\*/|\Z)|'
+        r'"(?:\\(?:.|\Z)|[^"\\])*(?:"|\Z)|'
+        r"'(?:\\(?:.|\Z)|[^'\\])*(?:'|\Z)",
+        re.DOTALL,
+    )
 
     def __init__(self, context: BuildContext):
         self.context = context
@@ -1398,57 +1411,22 @@ class IncludeScanner:
         except OSError as exc:
             raise BuildError(f"cannot scan includes in {path}: {exc}") from exc
         clean = self._strip_comments(text)
-        result: list[tuple[bool, str]] = []
-        for line in clean.splitlines():
-            match = self.directive.match(line)
-            if match:
-                result.append((match.group(1) == '"', match.group(2)))
+        result = [
+            (match.group(1) == '"', match.group(2))
+            for match in self.directive.finditer(clean)
+        ]
         self.parsed[path] = result
         return result
 
-    @staticmethod
-    def _strip_comments(text: str) -> str:
-        out = list(text)
-        i = 0
-        block = False
-        quote = ""
-        while i < len(out):
-            c = out[i]
-            n = out[i + 1] if i + 1 < len(out) else ""
-            if block:
-                if c == "*" and n == "/":
-                    out[i] = out[i + 1] = " "
-                    block = False
-                    i += 2
-                else:
-                    if c != "\n":
-                        out[i] = " "
-                    i += 1
-                continue
-            if quote:
-                if c == "\\":
-                    i += 2
-                    continue
-                if c == quote:
-                    quote = ""
-                i += 1
-                continue
-            if c in ('"', "'"):
-                quote = c
-                i += 1
-                continue
-            if c == "/" and n == "*":
-                out[i] = out[i + 1] = " "
-                block = True
-                i += 2
-                continue
-            if c == "/" and n == "/":
-                while i < len(out) and out[i] != "\n":
-                    out[i] = " "
-                    i += 1
-                continue
-            i += 1
-        return "".join(out)
+    @classmethod
+    def _strip_comments(cls, text: str) -> str:
+        def replace(match: re.Match[str]) -> str:
+            value = match.group()
+            if value.startswith("/"):
+                return " " + "\n" * value.count("\n")
+            return value
+
+        return cls.comment_or_literal.sub(replace, text)
 
     def _resolve(self, includer: str, quoted: bool, target: str,
                  roots: tuple[str, ...]) -> tuple[str | None, Node | None]:
@@ -1504,13 +1482,18 @@ class IncludeScanner:
         physical_root = self.context.physical(root)
         if not physical_root.is_dir():
             return
-        for directory, _directories, filenames in os.walk(physical_root):
+        for directory, directories, filenames in os.walk(physical_root):
+            directories[:] = [
+                name for name in directories if not name.startswith(".")
+            ]
             relative_directory = os.path.relpath(directory, physical_root)
             if relative_directory == ".":
                 relative_directory = ""
             else:
                 relative_directory = relative_directory.replace(os.sep, "/")
             for filename in filenames:
+                if filename.startswith("."):
+                    continue
                 relative = "/".join(filter(None, (relative_directory, filename)))
                 symbolic = self._normal_symbolic(root + "/" + relative)
                 value = (symbolic, None)
@@ -1554,8 +1537,10 @@ class Executor:
         self.progress_total = 0
         self.progress_active = False
         self.interactive = sys.stderr.isatty()
+        self.garbage_collector_started = False
 
     def run(self, roots: list[Node]) -> None:
+        self._start_garbage_collector()
         try:
             self._run(roots)
         finally:
@@ -1820,18 +1805,36 @@ class Executor:
                 child.unlink()
 
     def _discard_contents(self, path: Path) -> None:
-        if not path.exists():
+        while True:
+            self.grb.mkdir(parents=True, exist_ok=True)
+            destination = self.grb / uuid.uuid4().hex
+            try:
+                path.rename(destination)
+                return
+            except OSError:
+                try:
+                    path.lstat()
+                except OSError:
+                    return
+
+    def _start_garbage_collector(self) -> None:
+        if self.garbage_collector_started:
             return
-        self.grb.mkdir(parents=True, exist_ok=True)
-        destination = self.grb / uuid.uuid4().hex
-        try:
-            path.rename(destination)
-        except OSError:
-            return
-        threading.Thread(
-            target=shutil.rmtree, args=(destination,),
-            kwargs={"ignore_errors": True}, daemon=True,
-        ).start()
+        self.garbage_collector_started = True
+        threading.Thread(target=self._garbage_collector, daemon=True).start()
+
+    def _garbage_collector(self) -> None:
+        while True:
+            try:
+                subprocess.run(
+                    ["rm", "-rf", str(self.grb)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError:
+                pass
+            time.sleep(1)
 
     def _report(self, message: str) -> None:
         with self.print_lock:

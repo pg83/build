@@ -180,6 +180,32 @@ class BuildSystemTest(unittest.TestCase):
         )
         self.assertEqual(app.root.commands[0][-3:], ["-global-ld", "-dep-ld", "-local-ld"])
 
+    def test_dependency_compile_flags_are_calculated_once_per_language(self):
+        sources = []
+        for index in range(4):
+            for extension in ("c", "cpp"):
+                path = self.root / f"source-{index}.{extension}"
+                path.write_text("int value;\n")
+                sources.append(f"$(S)/{path.name}")
+
+        context = self.context()
+        dependency = context.interface(cflags=["-dep-c"], cxxflags=["-dep-cxx"])
+        context.program(name="app", srcs=sources, deps=[dependency])
+        with mock.patch.object(
+            context,
+            "_usage_compile_flags",
+            wraps=context._usage_compile_flags,
+        ) as usage_compile_flags:
+            context.build_graph()
+
+        self.assertEqual(
+            usage_compile_flags.call_args_list,
+            [
+                mock.call([dependency], False),
+                mock.call([dependency], True),
+            ],
+        )
+
     def test_clang_always_receives_target_and_gcc_cannot_cross_compile(self):
         (self.root / "main.c").write_text("int main(void) { return 0; }\n")
         cross = self.context()
@@ -554,6 +580,39 @@ class BuildSystemTest(unittest.TestCase):
             },
         )
 
+    def test_include_scanner_skips_hidden_files_and_directories(self):
+        (self.root / "main.cpp").write_text(
+            "#include <visible.h>\n"
+            "#include <.build/cas/cached.h>\n"
+            "#include <.git/private.h>\n"
+            "#include <nested/.private.h>\n",
+        )
+        (self.root / "visible.h").write_text("// visible\n")
+        (self.root / ".build/cas").mkdir(parents=True)
+        (self.root / ".build/cas/cached.h").write_text("// cached\n")
+        (self.root / ".git").mkdir()
+        (self.root / ".git/private.h").write_text("// private\n")
+        (self.root / "nested").mkdir()
+        (self.root / "nested/.private.h").write_text("// private\n")
+
+        context = self.context()
+        app = context.program(name="app", srcs=["$(S)/main.cpp"])
+        real_walk = runner.os.walk
+
+        def guarded_walk(root):
+            for directory, directories, filenames in real_walk(root):
+                yield directory, directories, filenames
+                if any(name.startswith(".") for name in directories):
+                    raise AssertionError("hidden directory was not pruned")
+
+        with mock.patch.object(runner.os, "walk", side_effect=guarded_walk):
+            context.build_graph()
+
+        self.assertEqual(
+            app.nodes[0].source_inputs,
+            {"$(S)/main.cpp", "$(S)/visible.h"},
+        )
+
     def test_include_resolution_does_not_stat_each_candidate(self):
         (self.root / "main.cpp").write_text(
             "".join(f"#include <missing-{index}.h>\n" for index in range(100)),
@@ -615,6 +674,69 @@ class BuildSystemTest(unittest.TestCase):
             app.nodes[0].source_inputs,
             {"$(S)/main.c", "$(S)/a.h", "$(S)/b.h"},
         )
+
+    def test_executor_starts_one_garbage_collector(self):
+        executor = runner.Executor(self.context(), 1, False, False)
+        with mock.patch.object(runner.threading, "Thread") as thread:
+            executor._start_garbage_collector()
+            executor._start_garbage_collector()
+
+        thread.assert_called_once_with(
+            target=executor._garbage_collector,
+            daemon=True,
+        )
+        thread.return_value.start.assert_called_once_with()
+
+    def test_executor_garbage_collector_removes_whole_grb_directory(self):
+        class StopCollector(Exception):
+            pass
+
+        executor = runner.Executor(self.context(), 1, False, False)
+        with (
+            mock.patch.object(runner.subprocess, "run") as run,
+            mock.patch.object(
+                runner.time,
+                "sleep",
+                side_effect=StopCollector,
+            ) as sleep,
+            self.assertRaises(StopCollector),
+        ):
+            executor._garbage_collector()
+
+        run.assert_called_once_with(
+            ["rm", "-rf", str(executor.grb)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        sleep.assert_called_once_with(1)
+
+    def test_executor_discard_recreates_grb_after_collector_race(self):
+        executor = runner.Executor(self.context(), 1, False, False)
+        work = executor.tmp / "work"
+        work.mkdir(parents=True)
+        (work / "output").write_text("data")
+        real_rename = Path.rename
+        attempts = 0
+
+        def racing_rename(path, destination):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                shutil.rmtree(executor.grb)
+            return real_rename(path, destination)
+
+        with mock.patch.object(
+            Path,
+            "rename",
+            autospec=True,
+            side_effect=racing_rename,
+        ):
+            executor._discard_contents(work)
+
+        self.assertEqual(attempts, 2)
+        self.assertFalse(work.exists())
+        self.assertEqual(len(list(executor.grb.iterdir())), 1)
 
     def test_executor_reuses_uid_manifest_and_cas(self):
         source = self.root / "input.txt"
@@ -891,12 +1013,22 @@ class BuildSystemTest(unittest.TestCase):
     def test_parser_ignores_commented_directives(self):
         source = self.root / "source.c"
         source.write_text(
-            '/* #include "hidden.h" */\n// #include "also-hidden.h"\n#include "seen.h"\n',
+            '/* #include "hidden.h" */\n'
+            '// #include "also-hidden.h"\n'
+            'const char* text = "/* #include \\"literal.h\\" */";\n'
+            "# /* comment */ include <first.h>\n"
+            "# /* comment\n"
+            " */ include <split-directive.h>\n"
+            "/* comment\n"
+            " * across lines\n"
+            " */ #include \"second.h\"\n",
         )
-        (self.root / "seen.h").write_text("\n")
         context = self.context()
         scanner = runner.IncludeScanner(context)
-        self.assertEqual(scanner._parse("$(S)/source.c"), [(True, "seen.h")])
+        self.assertEqual(
+            scanner._parse("$(S)/source.c"),
+            [(False, "first.h"), (True, "second.h")],
+        )
 
     def test_sigint_kills_worker_process_group_without_traceback(self):
         project = self.root / "project"
