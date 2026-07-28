@@ -1093,7 +1093,7 @@ class BuildContext:
                 src = source
                 source_inputs = []
             ext = Path(src).suffix.lower()
-            cxx = ext in (".cc", ".cpp", ".cxx", ".c++")
+            cxx = ext in (".cc", ".cpp", ".cxx", ".c++", ".mm")
             uses_cxx |= cxx
             compiler = self.cxx if cxx else self.cc
             common = [*include_flags, *self.cppflags, *self.cflags]
