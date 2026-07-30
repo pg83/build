@@ -692,8 +692,12 @@ class BuildSystemTest(unittest.TestCase):
             pass
 
         executor = runner.Executor(self.context(), 1, False, False)
+
+        def remove(*args, **kwargs):
+            self.assertTrue(executor.garbage_lock.locked())
+
         with (
-            mock.patch.object(runner.subprocess, "run") as run,
+            mock.patch.object(runner.subprocess, "run", side_effect=remove) as run,
             mock.patch.object(
                 runner.time,
                 "sleep",
@@ -721,6 +725,7 @@ class BuildSystemTest(unittest.TestCase):
 
         def racing_rename(path, destination):
             nonlocal attempts
+            self.assertTrue(executor.garbage_lock.locked())
             attempts += 1
             if attempts == 1:
                 shutil.rmtree(executor.grb)
