@@ -56,6 +56,7 @@ class BuildSystemTest(unittest.TestCase):
         self.assertEqual(executor.uids, self.out / "uid")
         self.assertEqual(executor.tmp, self.out / "tmp")
         self.assertEqual(executor.grb, self.out / "grb")
+        self.assertEqual(executor.locks, self.out / "lock")
 
     def test_global_flags_default_to_parsed_environment(self):
         environment = {

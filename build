@@ -1532,6 +1532,7 @@ class Executor:
         self.uids = context.build_root / "uid"
         self.tmp = context.build_root / "tmp"
         self.grb = context.build_root / "grb"
+        self.locks = context.build_root / "lock"
         self.print_lock = threading.Lock()
         self.progress_done = 0
         self.progress_total = 0
@@ -1627,12 +1628,14 @@ class Executor:
             with self.print_lock:
                 self.progress_total += 1
         work = self.tmp / node.uid
-        work.mkdir(parents=True, exist_ok=True)
-        fd = os.open(work, os.O_RDONLY)
+        lock = self.locks / node.uid
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock, os.O_RDONLY | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             if self._cached(node.uid):
                 return
+            work.mkdir(parents=True, exist_ok=True)
             self._remove_contents(work)
             for dep in node.deps:
                 assert dep.uid is not None
@@ -1646,8 +1649,8 @@ class Executor:
             self._store(node, work)
             self._progress(node)
         finally:
-            os.close(fd)
             self._discard_contents(work)
+            os.close(fd)
 
     def _run_command(self, node: Node, command: list[str], work: Path) -> None:
         args = [self._mount(arg, work) for arg in command]
@@ -2002,7 +2005,7 @@ def main(argv: list[str] | None = None) -> int:
         roots = _uniq(target.root for target in selected if target.root is not None)
         context.calculate_uids(roots)
         if args.clear:
-            for directory in ("cas", "uid", "tmp", "grb"):
+            for directory in ("cas", "uid", "tmp", "grb", "lock"):
                 shutil.rmtree(context.build_root / directory, ignore_errors=True)
         context.build_root.mkdir(parents=True, exist_ok=True)
         Executor(context, args.jobs, args.verbose, args.keep_going, args.ninja).run(roots)
