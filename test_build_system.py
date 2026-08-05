@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 
 import contextlib
+import concurrent.futures
 import importlib.machinery
 import importlib.util
 import io
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -28,7 +31,9 @@ LOADER.exec_module(runner)
 class BuildSystemTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        # BuildContext canonicalizes its roots. Mirror that here so assertions
+        # remain valid when the platform's temporary directory is a symlink.
+        self.root = Path(self.temp.name).resolve()
         self.out = self.root / "out"
 
     def tearDown(self):
@@ -37,18 +42,34 @@ class BuildSystemTest(unittest.TestCase):
     def context(self):
         return runner.BuildContext(self.root, self.out)
 
+    def run_build(self, build_file, *arguments):
+        return subprocess.run(
+            [
+                sys.executable,
+                ROOT / "build",
+                "--build-file",
+                build_file,
+                *arguments,
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
     def test_default_build_root_and_executor_layout(self):
         with mock.patch.dict("os.environ", {}, clear=True):
             args = runner.parse_args([])
             self.assertEqual(args.build_dir, ".build")
             self.assertIsNone(args.target)
             self.assertFalse(args.ninja)
+            self.assertFalse(args.strace)
         self.assertEqual(
             runner.parse_args(["--target", "aarch64-unknown-linux-gnu"]).target,
             "aarch64-unknown-linux-gnu",
         )
         self.assertTrue(runner.parse_args(["--ninja"]).ninja)
         self.assertTrue(runner.parse_args(["-T"]).ninja)
+        self.assertTrue(runner.parse_args(["--strace"]).strace)
         context = self.context()
         self.assertEqual(context.target, context.host)
         executor = runner.Executor(context, 1, False, False)
@@ -56,7 +77,6 @@ class BuildSystemTest(unittest.TestCase):
         self.assertEqual(executor.uids, self.out / "uid")
         self.assertEqual(executor.tmp, self.out / "tmp")
         self.assertEqual(executor.grb, self.out / "grb")
-        self.assertEqual(executor.locks, self.out / "lock")
 
     def test_global_flags_default_to_parsed_environment(self):
         environment = {
@@ -343,7 +363,7 @@ class BuildSystemTest(unittest.TestCase):
             graph,
             project / "build.py",
         )
-        decoded_app, kind = runner.BuildContext._select_imported_root(
+        decoded_app, kind, exported_name = runner.BuildContext._select_imported_root(
             decoded,
             exports,
             "$(B)/app",
@@ -351,6 +371,7 @@ class BuildSystemTest(unittest.TestCase):
             target_name="app",
         )
         self.assertEqual(kind, "program")
+        self.assertEqual(exported_name, "app")
         decoded_closure = runner.BuildContext._node_closure([decoded_app])
         self.assertEqual(
             len([
@@ -409,9 +430,10 @@ class BuildSystemTest(unittest.TestCase):
         (child / "build.py").write_text(
             "import build\n"
             "build.flags.allow({'MODE': {'default': 'child'}})\n"
+            "seen_extra = '-DSEEN_EXTRA' if '-import-cpp' in build.cppflags else '-DMISSING_EXTRA'\n"
             "child = library(\n"
             "    srcs=['$(S)/child.cpp'],\n"
-            "    cppflags=['-DMODE=' + build.flags.MODE],\n"
+            "    cppflags=['-DMODE=' + build.flags.MODE, seen_extra],\n"
             ")\n",
         )
         (project / "build.py").write_text(
@@ -445,8 +467,89 @@ class BuildSystemTest(unittest.TestCase):
         self.assertIn("-import-c", command)
         self.assertIn("-import-cxx", command)
         self.assertIn("-import-cpp", command)
+        self.assertIn("-DSEEN_EXTRA", command)
+        self.assertNotIn("-DMISSING_EXTRA", command)
         self.assertIn("-DMODE=child", command)
         self.assertNotIn("-DMODE=parent-cli", command)
+
+    def test_nested_imports_append_flags_to_inherited_environment(self):
+        project = self.root / "nested-flags"
+        child = project / "child"
+        grandchild = child / "grandchild"
+        grandchild.mkdir(parents=True)
+        (grandchild / "leaf.cpp").write_text("int leaf() { return 0; }\n")
+        (grandchild / "build.py").write_text(
+            "leaf = library(srcs=['$(S)/leaf.cpp'])\n",
+        )
+        (child / "build.py").write_text(
+            "leaf = import_build(\n"
+            "    'grandchild/build.py', 'libleaf.a',\n"
+            "    extra_cppflags=['-from-child'],\n"
+            ")\n",
+        )
+        (project / "build.py").write_text(
+            "leaf = import_build(\n"
+            "    'child/build.py', 'libleaf.a',\n"
+            "    extra_cppflags=['-from-parent'],\n"
+            ")\n",
+        )
+
+        with mock.patch.dict("os.environ", {"CPPFLAGS": "-from-env"}, clear=False):
+            context = runner.BuildContext(project, self.out)
+            context.load(project / "build.py")
+            context.build_graph()
+
+        leaf = context.target_names["leaf"]
+        compile_node = next(
+            node for node in leaf.nodes
+            if node.outputs and "/obj/leaf/" in node.outputs[0]
+        )
+        command = compile_node.commands[0]
+        inherited = ["-from-env", "-from-parent", "-from-child"]
+        self.assertEqual([command.count(flag) for flag in inherited], [1, 1, 1])
+        self.assertEqual(
+            [command.index(flag) for flag in inherited],
+            sorted(command.index(flag) for flag in inherited),
+        )
+
+    def test_import_preserves_host_environment_flags_verbatim(self):
+        environment = {
+            "CFLAGS": "-base-c",
+            "CXXFLAGS": "-base-cxx",
+            "CPPFLAGS": "-base-cpp",
+            "HOST_CFLAGS": "-host-c '-host c value'",
+            "HOST_CXXFLAGS": "-host-cxx",
+            "HOST_CPPFLAGS": "-host-cpp",
+        }
+        encoded = json.dumps({"version": 2, "nodes": [], "exports": []})
+        with mock.patch.dict("os.environ", environment, clear=True):
+            context = self.context()
+            with mock.patch.object(
+                context,
+                "_invoke_graph",
+                return_value=encoded,
+            ) as invoke_graph:
+                context._load_imported_graph(
+                    self.root / "child" / "build.py",
+                    context.target,
+                    extra_cflags=["-extra-c"],
+                    extra_cxxflags=["-extra-cxx"],
+                    extra_cppflags=["-extra-cpp"],
+                    index_primary=False,
+                )
+
+        child_env = invoke_graph.call_args.args[2]
+        self.assertEqual(shlex.split(child_env["CFLAGS"]), ["-base-c", "-extra-c"])
+        self.assertEqual(
+            shlex.split(child_env["CXXFLAGS"]),
+            ["-base-cxx", "-extra-cxx"],
+        )
+        self.assertEqual(
+            shlex.split(child_env["CPPFLAGS"]),
+            ["-base-cpp", "-extra-cpp"],
+        )
+        for variable in ("HOST_CFLAGS", "HOST_CXXFLAGS", "HOST_CPPFLAGS"):
+            self.assertEqual(child_env[variable], environment[variable])
 
     def test_import_build_caches_one_graph_for_multiple_outputs(self):
         project = self.root / "multi-import"
@@ -460,18 +563,53 @@ class BuildSystemTest(unittest.TestCase):
         )
         context = runner.BuildContext(project, self.out)
         with mock.patch.object(
-            runner.subprocess,
-            "run",
-            wraps=subprocess.run,
-        ) as run:
+            context,
+            "_invoke_graph",
+            wraps=context._invoke_graph,
+        ) as invoke_graph:
             one = context.import_build("child/build.py", "libone.a")
             two = context.import_build("child/build.py", "libtwo.a")
-        self.assertEqual(run.call_count, 1)
+        invoke_graph.assert_called_once()
         self.assertNotEqual(one.root, two.root)
         self.assertEqual(
             {one.root.outputs[0], two.root.outputs[0]},
             {"$(B)/child/libone.a", "$(B)/child/libtwo.a"},
         )
+
+    def test_import_build_links_parent_dependencies_into_program_root(self):
+        project = self.root / "import-deps"
+        dependency = project / "dependency"
+        application = project / "application"
+        dependency.mkdir(parents=True)
+        application.mkdir()
+        (dependency / "support.c").write_text("int support(void) { return 0; }\n")
+        (dependency / "build.py").write_text(
+            "support = library(srcs=['$(S)/support.c'])\n",
+        )
+        (application / "main.c").write_text("int main(void) { return 0; }\n")
+        (application / "build.py").write_text(
+            "app = program(srcs=['$(S)/main.c'])\n",
+        )
+        (project / "build.py").write_text(
+            "support_local = import_build('dependency/build.py', 'libsupport.a')\n"
+            "app_local = import_build(\n"
+            "    'application/build.py', 'app', deps=[support_local, support_local],\n"
+            ")\n"
+            "install(app_local)\n",
+        )
+
+        context = runner.BuildContext(project, self.out)
+        context.load(project / "build.py")
+        context.build_graph()
+
+        support = context.target_names["support"]
+        app = context.target_names["app"]
+        self.assertEqual(support.output, "$(B)/dependency/libsupport.a")
+        self.assertEqual(app.root.inputs.count(support.output), 1)
+        self.assertEqual(app.root.commands[-1].count(support.output), 1)
+        self.assertIn(support.root, app.root.deps)
+        self.assertNotIn("support_local", context.target_names)
+        self.assertNotIn("app_local", context.target_names)
 
     def test_node_descriptions_and_colors(self):
         (self.root / "thing.cpp").write_text("int thing;\n")
@@ -872,7 +1010,9 @@ class BuildSystemTest(unittest.TestCase):
             [str(project / "build")], cwd=project,
             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        self.assertFalse(published.exists())
+        self.assertTrue(published.is_symlink())
+        self.assertEqual(published.readlink(), Path(".build/bin/app"))
+        self.assertEqual(published.read_text(), "ok")
 
     def test_groups_are_additive_cli_aliases(self):
         project = self.root / "project"
@@ -1035,6 +1175,161 @@ class BuildSystemTest(unittest.TestCase):
             scanner._parse("$(S)/source.c"),
             [(False, "first.h"), (True, "second.h")],
         )
+
+    def test_strace_parser_counts_stat_and_file_backed_mmap(self):
+        stat_input = self.root / "from-stat"
+        mmap_input = self.root / "from-mmap"
+        declared = self.root / "declared"
+        generated = self.root / "generated"
+        build_root = self.root / ".out"
+        build_output = build_root / "generated"
+        for path in (stat_input, mmap_input, declared, generated, build_output):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        payload = {
+            "source_root": str(self.root),
+            "build_root": str(build_root),
+            "cwd": str(self.root),
+            "inputs": [str(declared)],
+        }
+        trace = (
+            f'stat("{stat_input}", {{st_mode=S_IFREG|0644}}) = 0\n'
+            f'mmap(NULL, 1, PROT_READ, MAP_PRIVATE, 3<{mmap_input}>, 0) = 0x1234\n'
+            f'open("{declared}", O_RDONLY) = 4<{declared}>\n'
+            f'42 open("{generated}", O_RDWR|O_CREAT|O_EXCL, 0600 <unfinished ...>\n'
+            f'42 <... open resumed>) = 5<{generated}>\n'
+            f'stat("{generated}", {{st_mode=S_IFREG|0600}}) = 0\n'
+            f'mmap(NULL, 1, PROT_READ, MAP_PRIVATE, 5<{generated}>, 0) = 0x5678\n'
+            f'newfstatat(7<{self.root}/vanished (deleted)>, "from-dirfd", '
+            f'{{st_mode=S_IFREG|0644}}, 0) = 0\n'
+            f'newfstatat(AT_FDCWD<{build_root}>, "generated", '
+            f'{{st_mode=S_IFREG|0644}}, 0) = 0\n'
+        )
+
+        self.assertEqual(
+            runner._strace_missing_inputs(payload, trace),
+            [
+                "$(S)/from-mmap",
+                "$(S)/from-stat",
+                "$(S)/vanished/from-dirfd",
+            ],
+        )
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and shutil.which("strace"),
+        "strace is only available on Linux",
+    )
+    @unittest.skipIf(
+        os.environ.get("BUILD_STRACE_ACTIVE"),
+        "ptrace cannot be nested inside a strace audit",
+    )
+    def test_strace_rejects_undeclared_read_on_a_cached_node(self):
+        hidden = self.root / "hidden.txt"
+        hidden.write_text("hidden")
+        build_file = self.root / "build.py"
+        build_file.write_text(
+            "target = command(\n"
+            "    outputs=['$(B)/result'],\n"
+            "    cmd=['python3', '-c', \"import os; from pathlib import Path; "
+            "os.stat(r'$(S)/hidden.txt'); Path(r'$(B)/result').touch()\"],\n"
+            ")\n"
+            "install(target)\n",
+        )
+
+        cached = self.run_build(build_file, "-B", ".out", "install")
+        self.assertEqual(cached.returncode, 0, cached.stderr)
+
+        traced = self.run_build(
+            build_file,
+            "-B", ".out",
+            "--strace",
+            "install",
+        )
+        self.assertNotEqual(traced.returncode, 0)
+        self.assertIn("undeclared source input(s)", traced.stderr)
+        self.assertIn("$(S)/hidden.txt", traced.stderr)
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and shutil.which("strace"),
+        "strace is only available on Linux",
+    )
+    @unittest.skipIf(
+        os.environ.get("BUILD_STRACE_ACTIVE"),
+        "ptrace cannot be nested inside a strace audit",
+    )
+    def test_strace_accepts_inputs_from_the_dependency_closure(self):
+        (self.root / "dependency.txt").write_text("dependency")
+        (self.root / "direct.txt").write_text("direct")
+        build_file = self.root / "build.py"
+        build_file.write_text(
+            "dependency = command(\n"
+            "    inputs=['$(S)/dependency.txt'],\n"
+            "    outputs=['$(B)/dependency'],\n"
+            "    cmd=['python3', '-c', \"from pathlib import Path; "
+            "Path(r'$(S)/dependency.txt').read_text(); "
+            "Path(r'$(B)/dependency').touch()\"],\n"
+            ")\n"
+            "target = command(\n"
+            "    inputs=['$(S)/direct.txt'],\n"
+            "    deps=[dependency],\n"
+            "    outputs=['$(B)/result'],\n"
+            "    cmd=['python3', '-c', \"from pathlib import Path; "
+            "Path(r'$(S)/direct.txt').read_text(); "
+            "Path(r'$(S)/dependency.txt').read_text(); "
+            "Path(r'$(B)/result').touch()\"],\n"
+            ")\n"
+            "install(target)\n",
+        )
+
+        result = self.run_build(
+            build_file,
+            "-B", ".out",
+            "--strace",
+            "install",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_parallel_strace_execution_with_same_uid_keeps_stable_lock(self):
+        executor = runner.Executor(
+            self.context(),
+            jobs=2,
+            verbose=False,
+            keep_going=False,
+            strace=True,
+        )
+        node = runner.Node(inputs=[], outputs=[], commands=[])
+        node.uid = "same-uid"
+        discarded = threading.Event()
+        acquisition_lock = threading.Lock()
+        acquisitions = 0
+        real_flock = runner.fcntl.flock
+        real_discard = executor._discard_contents
+
+        def flock(fd, operation):
+            nonlocal acquisitions
+            real_flock(fd, operation)
+            with acquisition_lock:
+                acquisitions += 1
+                acquisition = acquisitions
+            if acquisition == 2:
+                self.assertTrue(discarded.wait(timeout=5))
+
+        def discard(path):
+            real_discard(path)
+            discarded.set()
+
+        executor._discard_contents = discard
+        with mock.patch.object(runner.fcntl, "flock", side_effect=flock):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = [
+                        pool.submit(executor._execute, node, True, False)
+                        for _ in range(2)
+                    ]
+                    for future in futures:
+                        future.result(timeout=10)
+
+        self.assertEqual(acquisitions, 2)
 
     def test_sigint_kills_worker_process_group_without_traceback(self):
         project = self.root / "project"

@@ -78,10 +78,12 @@ Or request a named target or group explicitly:
 ```
 
 An explicit CLI target is also published as a relative symlink in the source
-root. In this example `./app` points to `.build/app`. Selecting a group builds
-its members without publishing them individually. The runner replaces an
-existing symlink atomically but never replaces a regular source file or
-directory. Add published target names to the project's `.gitignore`.
+root. In this example `./app` points to `.build/app`. A bare invocation
+publishes every member of the default `install` group. Other explicitly
+selected groups build their members without publishing them individually. The
+runner replaces an existing symlink atomically but never replaces a regular
+source file or directory. Add published target names to the project's
+`.gitignore`.
 
 ## Paths
 
@@ -189,9 +191,9 @@ separate.
 
 The host configuration does not inherit CLI `-D` flags. Shell-parsed
 `HOST_CPPFLAGS`, `HOST_CFLAGS`, and `HOST_CXXFLAGS` are appended to host
-compiles. Configuration identity includes the target triple, `-D` values, and
-these imported extra flags, so a native build reuses the current graph only
-when the configurations really match.
+compiles and propagate unchanged through nested imports. Configuration
+identity includes the target triple and `-D` values. Compiler flags already
+participate in each node UID through its command line.
 
 ## Targets
 
@@ -295,13 +297,22 @@ import_build(
     extra_cflags=(),
     extra_cxxflags=(),
     extra_cppflags=(),
+    deps=(),
 )
 ```
 
 Loads another source-tree `build.py`, imports the transitive closure of the
 export whose filename is `output_name`, and returns it as a target. The child
 graph inherits `build.target` and the optional language-specific extra flags,
-but it does not inherit CLI `-D` flags.
+but it does not inherit CLI `-D` flags. Extra flags join the child's ordinary
+`CFLAGS`, `CXXFLAGS`, and `CPPFLAGS`, so its `build.py` can inspect them. Every
+nested `import_build()` appends its own values to the environment it inherited;
+flags therefore accumulate in import order.
+
+`deps` is supported when the imported root is a program. Each dependency must
+already have a built output; that output is added to the imported program's
+dependency list and appended to its link command. This is useful when an
+imported test program must link an archive produced by the parent graph.
 
 ### `pkg_config()`
 
@@ -406,6 +417,15 @@ Commands inherit stdout. Their stderr is captured so concurrent diagnostics do
 not interleave, then emitted as one block. Interrupting the build kills its
 worker process group, including subprocesses started by commands.
 
+### Undeclared-input audit
+
+On Linux, `--strace` reruns every selected node under `strace`, including cache
+hits, and rejects successful reads from the source tree that are not declared
+by the node or its transitive dependency closure. Generated files, build roots,
+`.git`, failed probes, and files created by the command itself are ignored.
+This mode requires `strace` on `PATH` and is intended for CI or periodic build
+graph audits rather than ordinary incremental builds.
+
 ## CLI
 
 ```text
@@ -419,6 +439,7 @@ worker process group, including subprocesses started by commands.
   -k, --keep-going      continue independent work after a failed node
   -v, --verbose         print cache hits and command starts
   -T, --ninja           repaint one progress line on a terminal
+      --strace           rerun nodes and reject undeclared source reads
       --clear           clear CAS, UID, temporary, and garbage directories
       --list            list named targets and groups without building
 ```
