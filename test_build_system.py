@@ -421,6 +421,38 @@ class BuildSystemTest(unittest.TestCase):
         self.assertLess(command.index("-I$(S)"),
                         command.index("-I/external/dependency"))
 
+    def test_header_probe_uses_target_compiler_and_environment_flags(self):
+        context = runner.BuildContext(
+            self.root,
+            self.out,
+            target="aarch64-unknown-linux-gnu",
+        )
+        context.cflags = ["-target-c"]
+        context.cxxflags = ["-target-cxx"]
+        context.cppflags = ["-target-cpp"]
+        compiler = ["target-c++", "--target=aarch64-unknown-linux-gnu"]
+        completed = subprocess.CompletedProcess(compiler, 0)
+        with mock.patch.object(
+            context,
+            "_compiler_command",
+            return_value=compiler,
+        ), mock.patch.object(
+            runner.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            self.assertTrue(context.have_header("optional/header.h"))
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[:2], compiler)
+        self.assertIn("-target-c", command)
+        self.assertIn("-target-cxx", command)
+        self.assertIn("-target-cpp", command)
+        self.assertEqual(
+            run.call_args.kwargs["input"],
+            "#include <optional/header.h>\n",
+        )
+
     def test_import_build_inherits_target_and_language_specific_extra_flags(self):
         project = self.root / "project"
         child = project / "child"
@@ -592,6 +624,7 @@ class BuildSystemTest(unittest.TestCase):
         )
         (project / "build.py").write_text(
             "support_local = import_build('dependency/build.py', 'libsupport.a')\n"
+            "support_local.ldflags += ['-lsupport-runtime']\n"
             "app_local = import_build(\n"
             "    'application/build.py', 'app', deps=[support_local, support_local],\n"
             ")\n"
@@ -607,6 +640,8 @@ class BuildSystemTest(unittest.TestCase):
         self.assertEqual(support.output, "$(B)/dependency/libsupport.a")
         self.assertEqual(app.root.inputs.count(support.output), 1)
         self.assertEqual(app.root.commands[-1].count(support.output), 1)
+        archive = app.root.commands[-1].index(support.output)
+        self.assertEqual(app.root.commands[-1][archive + 1], "-lsupport-runtime")
         self.assertIn(support.root, app.root.deps)
         self.assertNotIn("support_local", context.target_names)
         self.assertNotIn("app_local", context.target_names)

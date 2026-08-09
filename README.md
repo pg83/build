@@ -311,8 +311,9 @@ flags therefore accumulate in import order.
 
 `deps` is supported when the imported root is a program. Each dependency must
 already have a built output; that output is added to the imported program's
-dependency list and appended to its link command. This is useful when an
-imported test program must link an archive produced by the parent graph.
+dependency list and appended to its link command, followed by its transitive
+`ldflags`. This is useful when an imported test program must link an archive
+produced by the parent graph.
 
 ### `pkg_config()`
 
@@ -332,6 +333,20 @@ false in a Python condition and contributes no flags.
 ```python
 protocol_root = pkg_config_variable("wayland-protocols", "pkgdatadir")
 ```
+
+### `have_header()`
+
+```python
+if have_header("optional/api.h"):
+    backend = dependency(ldflags=["-loptional"])
+else:
+    backend = dependency()
+```
+
+Preprocesses an include with the configured C++ compiler, target triple, and
+environment-derived `CPPFLAGS`, `CFLAGS`, and `CXXFLAGS`. It returns false when
+the compiler cannot include the header. The probe runs while `build.py` is
+loaded, so it is intended for system or toolchain headers, not generated files.
 
 ### `command()`
 
