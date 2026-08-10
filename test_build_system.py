@@ -70,6 +70,7 @@ class BuildSystemTest(unittest.TestCase):
         self.assertTrue(runner.parse_args(["--ninja"]).ninja)
         self.assertTrue(runner.parse_args(["-T"]).ninja)
         self.assertTrue(runner.parse_args(["--strace"]).strace)
+        self.assertEqual(runner.parse_args(["--cache-dir", "shared"]).cache_dir, "shared")
         context = self.context()
         self.assertEqual(context.target, context.host)
         executor = runner.Executor(context, 1, False, False)
@@ -77,6 +78,13 @@ class BuildSystemTest(unittest.TestCase):
         self.assertEqual(executor.uids, self.out / "uid")
         self.assertEqual(executor.tmp, self.out / "tmp")
         self.assertEqual(executor.grb, self.out / "grb")
+
+        shared = self.root / "shared-cache"
+        executor = runner.Executor(context, 1, False, False, cache_root=shared)
+        self.assertEqual(executor.cas, shared / "cas")
+        self.assertEqual(executor.uids, shared / "uid")
+        self.assertEqual(executor.tmp, shared / "tmp")
+        self.assertEqual(executor.grb, shared / "grb")
 
     def test_global_flags_default_to_parsed_environment(self):
         environment = {
@@ -952,6 +960,47 @@ class BuildSystemTest(unittest.TestCase):
         self.assertEqual(count.read_text(), "1")
         self.assertEqual(cached_stderr.getvalue(), "")
 
+    def test_executor_shares_cache_between_distinct_build_roots(self):
+        source = self.root / "input.txt"
+        source.write_text("shared\n")
+        shared = self.root / "shared-cache"
+
+        def graph(build_root):
+            context = runner.BuildContext(self.root, build_root, runner.Flags({}))
+            target = context.command(
+                name="copy",
+                inputs=["$(S)/input.txt"],
+                outputs=["$(B)/result.txt"],
+                cmd=[[
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; import sys; Path(sys.argv[2]).write_text(Path(sys.argv[1]).read_text())",
+                    "$(S)/input.txt",
+                    "$(B)/result.txt",
+                ]],
+            )
+            context.build_graph()
+            context.calculate_uids([target.root])
+            return context, target
+
+        first, first_target = graph(self.root / "first-build")
+        with contextlib.redirect_stderr(io.StringIO()):
+            runner.Executor(
+                first, 1, False, False, cache_root=shared,
+            ).run([first_target.root])
+
+        second, second_target = graph(self.root / "second-build")
+        with (
+            mock.patch.object(runner.Executor, "_run_command") as run_command,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            runner.Executor(
+                second, 1, False, False, cache_root=shared,
+            ).run([second_target.root])
+
+        run_command.assert_not_called()
+        self.assertEqual((second.build_root / "result.txt").read_text(), "shared\n")
+
     def test_executor_reports_cache_miss_progress(self):
         context = self.context()
         target = context.command(
@@ -1110,7 +1159,7 @@ class BuildSystemTest(unittest.TestCase):
         ):
             context.load(self.root / "build.py")
 
-    def test_publish_refuses_to_replace_source_file(self):
+    def test_publish_preserves_source_file_and_skips_symlink(self):
         context = self.context()
         target = context.command(
             name="app", outputs=["$(B)/app"],
@@ -1120,8 +1169,7 @@ class BuildSystemTest(unittest.TestCase):
         source = self.root / "app"
         source.write_text("keep")
 
-        with self.assertRaisesRegex(runner.BuildError, "refusing to replace non-symlink"):
-            context.publish([target])
+        context.publish([target])
         self.assertEqual(source.read_text(), "keep")
 
     def test_build_py_reads_declared_flags(self):
@@ -1147,7 +1195,7 @@ class BuildSystemTest(unittest.TestCase):
         context.calculate_uids([target.root])
         resolved = target.root.commands[0][0]
         self.assertTrue(os.path.isabs(resolved))
-        self.assertEqual(resolved, os.path.realpath(shutil.which("true")))
+        self.assertEqual(resolved, os.path.abspath(shutil.which("true")))
 
     def test_resolve_tool_rejects_missing_command(self):
         with self.assertRaisesRegex(runner.BuildError, "command not found in PATH"):

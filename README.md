@@ -82,8 +82,9 @@ root. In this example `./app` points to `.build/app`. A bare invocation
 publishes every member of the default `install` group. Other explicitly
 selected groups build their members without publishing them individually. The
 runner replaces an existing symlink atomically but never replaces a regular
-source file or directory. Add published target names to the project's
-`.gitignore`.
+source file or directory; when one already has the target name, publication is
+skipped and the artifact remains available below the build root. Add published
+target names to the project's `.gitignore`.
 
 ## Paths
 
@@ -122,7 +123,8 @@ build.ldflags += ["-pthread"]
 There is one include search configuration for the entire build. Do not repeat
 include roots on individual targets.
 
-The flag lists initially contain shell-parsed environment values:
+The flag lists initially expose shell-parsed environment values while
+`build.py` is evaluated:
 
 - `CPPFLAGS` initializes `build.cppflags`.
 - `CFLAGS` initializes `build.cflags`.
@@ -136,10 +138,13 @@ flags extend the global flags and are placed later on the command line.
 target triple. They are equal unless `--target` was passed or the graph was
 loaded by a cross-compiling `import_build()`.
 
-For compilation the order is global preprocessor/language flags, global include
-roots, public flags from dependencies, then target-local flags. For linking it
-is global linker flags, dependency linker flags, then target-local linker
-flags.
+For compilation the order is project global preprocessor/language flags,
+global include roots, public flags from dependencies, target-local flags, then
+environment flags. For linking it is project global linker flags, dependency
+linker flags, target-local flags, then environment flags. This makes ordinary
+environment flags user overrides while keeping them visible to build files.
+Sanitizer-selection flags supplied through `CFLAGS` or `CXXFLAGS` are also
+forwarded to compiler-driver link commands.
 
 ## Build flags
 
@@ -347,7 +352,6 @@ Preprocesses an include with the configured C++ compiler, target triple, and
 environment-derived `CPPFLAGS`, `CFLAGS`, and `CXXFLAGS`. It returns false when
 the compiler cannot include the header. The probe runs while `build.py` is
 loaded, so it is intended for system or toolchain headers, not generated files.
-
 ### `command()`
 
 ```python
@@ -417,12 +421,16 @@ roots.
 
 Each node UID is MD5 over its canonical command description, dependency UIDs,
 and the names and MD5 hashes of source inputs. A command tool named without a
-path is resolved through `PATH` to its real path before UID calculation, so
-switching toolchains changes node UIDs instead of silently reusing artifacts
-built by another toolchain. Nodes run in parallel once their
+path is resolved through `PATH` to its absolute selected path before UID
+calculation. The final symlink is preserved because multicall programs use
+`argv[0]` to select their behavior; content-addressed PATH realms already carry
+the toolchain identity in that path. Nodes run in parallel once their
 dependencies are ready. Produced files are stored in a SHA-256-addressed CAS
 and restored into the build root as symlinks. A failed command never publishes
 a manifest.
+
+Every command receives `BUILD_JOBS` with the runner's job count and `TMPDIR`
+pointing at its private UID work directory.
 
 The runner intentionally has no persistent configuration state. Deleting
 `.build`, or passing `--clear`, discards reusable build artifacts without
@@ -447,6 +455,7 @@ graph audits rather than ordinary incremental builds.
 ./build [options] [targets...]
 
   -B, --build-dir DIR   build root; default .build or environment variable B
+      --cache-dir DIR   shared CAS/UID root; default build root or BUILD_CACHE_DIR
       --target TRIPLE   target triple; default is the current host platform
   -j, --jobs N          parallel worker count; default CPU count
   -D KEY[=VALUE]        build flag readable in build.py as build.flags.KEY
@@ -458,6 +467,11 @@ graph audits rather than ordinary incremental builds.
       --clear           clear CAS, UID, temporary, and garbage directories
       --list            list named targets and groups without building
 ```
+
+`--cache-dir` separates immutable cache state from the materialized build
+root. This allows concurrent checkouts to use distinct `-B` directories while
+sharing node manifests and CAS objects. UID-scoped work locks prevent duplicate
+execution of the same node across those processes.
 
 Default progress output keeps one line per completed node. `--ninja` uses an
 in-place progress line on a terminal and falls back to normal lines when stderr
