@@ -19,7 +19,7 @@ class StyleTest(unittest.TestCase):
             "check_output",
             return_value=b"platform.mm\0",
         ) as check_output:
-            self.assertEqual(style.source_files([]), [ROOT / "platform.mm"])
+            self.assertEqual(style.source_files([]), [style.ROOT / "platform.mm"])
 
         check_output.assert_called_once_with(
             [
@@ -29,9 +29,10 @@ class StyleTest(unittest.TestCase):
                 "--",
                 "*.cpp",
                 "*.h",
+                "*.hpp",
                 "*.mm",
             ],
-            cwd=ROOT,
+            cwd=style.ROOT,
         )
 
 
