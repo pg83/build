@@ -42,6 +42,12 @@ class BuildSystemTest(unittest.TestCase):
     def context(self):
         return runner.BuildContext(self.root, self.out)
 
+    def fake_clang_environment(self):
+        compiler = self.root / "clang"
+        compiler.write_text("#!/bin/sh\nexit 1\n")
+        compiler.chmod(0o755)
+        return {"CC": str(compiler), "CXX": str(compiler)}
+
     def run_build(self, build_file, *arguments):
         return subprocess.run(
             [
@@ -172,7 +178,8 @@ class BuildSystemTest(unittest.TestCase):
     def test_target_flags_follow_global_and_dependency_flags(self):
         (self.root / "main.c").write_text("int c;\n")
         (self.root / "main.cpp").write_text("int cxx;\n")
-        context = self.context()
+        with mock.patch.dict("os.environ", self.fake_clang_environment(), clear=False):
+            context = self.context()
         context.cppflags = ["-global-cpp"]
         context.cflags = ["-global-c"]
         context.cxxflags = ["-global-cxx"]
@@ -237,7 +244,8 @@ class BuildSystemTest(unittest.TestCase):
 
     def test_clang_always_receives_target_and_gcc_cannot_cross_compile(self):
         (self.root / "main.c").write_text("int main(void) { return 0; }\n")
-        cross = self.context()
+        with mock.patch.dict("os.environ", self.fake_clang_environment(), clear=False):
+            cross = self.context()
         cross.target = "aarch64-unknown-linux-gnu"
         app = cross.program(name="app", srcs=["$(S)/main.c"])
         cross.build_graph()
@@ -308,6 +316,7 @@ class BuildSystemTest(unittest.TestCase):
             "install(app, generated, generated_again)\n",
         )
         environment = {
+            **self.fake_clang_environment(),
             "HOST_CFLAGS": "-host-c",
             "HOST_CXXFLAGS": "-host-cxx",
             "HOST_CPPFLAGS": "-host-cpp",
@@ -489,13 +498,14 @@ class BuildSystemTest(unittest.TestCase):
             "app = program(srcs=['$(S)/main.c'], deps=[child])\n",
         )
 
-        context = runner.BuildContext(
-            project,
-            self.out,
-            runner.Flags({"MODE": "parent-cli"}),
-            target="aarch64-unknown-linux-gnu",
-        )
-        context.load(project / "build.py")
+        with mock.patch.dict("os.environ", self.fake_clang_environment(), clear=False):
+            context = runner.BuildContext(
+                project,
+                self.out,
+                runner.Flags({"MODE": "parent-cli"}),
+                target="aarch64-unknown-linux-gnu",
+            )
+            context.load(project / "build.py")
         context.build_graph()
         imported = context.target_names["child"]
         compile_node = next(
