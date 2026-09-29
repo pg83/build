@@ -1,8 +1,12 @@
 # build runner output
 /.build/
 /.build-*/
-# symlinks ./build publishes for explicitly named test nodes
+# symlinks ./build publishes for explicitly named nodes
 /test_build_system
 /test_style
+/coverage
+# coverage.py run outside the graph
+.coverage
+.coverage.*
 __pycache__/
 *.pyc

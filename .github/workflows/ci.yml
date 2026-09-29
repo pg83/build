@@ -32,6 +32,40 @@ jobs:
       - name: Audit the test nodes' declared inputs
         run: ./build -k -j "$(nproc)" --strace test
 
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # strace so the audit paths count too; coverage.py in a venv whose
+      # python3 leads PATH, so the runners the tests start are measured as
+      # well (.coveragerc: patch = subprocess).
+      - name: Install strace and coverage.py
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends strace
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --disable-pip-version-check coverage==7.16.2
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Run the test suite measured
+        run: ./build -k -j "$(nproc)" -Dcoverage coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          use_oidc: true
+          files: .build/coverage.xml
+          disable_search: true
+          fail_ci_if_error: true
+          verbose: true
+
   tests-darwin:
     name: Tests Darwin
     runs-on: macos-15

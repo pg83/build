@@ -1,0 +1,24 @@
+codecov:
+  branch: main
+
+coverage:
+  precision: 2
+  round: down
+  range: "50...90"
+  status:
+    project:
+      default:
+        target: 60%
+        threshold: 0%
+        informational: false
+    patch: off
+
+comment:
+  layout: "reach, diff, files"
+  require_changes: false
+
+# Only `build` and `style.py` are measured (.coveragerc); the suite and the
+# graph that runs it are not code under test.
+ignore:
+  - "test_*.py"
+  - "build.py"

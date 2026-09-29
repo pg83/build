@@ -541,8 +541,20 @@ per test module, with the module and the file it covers as inputs, so
 runs both modules in parallel and keeps a green module cached until it or the
 code it covers changes. `./build --strace test` audits the test nodes' declared
 inputs like any project's nodes. `python3 -m unittest` still runs the suite
-directly. CI (`.github/workflows/ci.yml`) runs `./build test` on Linux and
-macOS for every push and pull request.
+directly.
+
+With [coverage.py](https://coverage.readthedocs.io/) 7.10 or later on `PATH`,
+
+```sh
+./build -Dcoverage coverage
+```
+
+measures `build` and `style.py` across the test process, the child `build`
+forks to do its work and every runner the tests start (`.coveragerc`), prints
+the line report, fails below the floor set in `build.py`, and writes
+`.build/coverage.xml`. CI (`.github/workflows/ci.yml`) runs `./build test` on
+Linux and macOS for every push and pull request, and uploads the Linux
+coverage to Codecov.
 
 The `build` file is the distributable artifact. Projects should update their
 vendored copy from this repository without modifying it locally.

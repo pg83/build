@@ -1,0 +1,18 @@
+# coverage.py settings for `./build -Dcoverage coverage` (see build.py).
+
+[run]
+# `build` has no .py suffix and the tests copy it into scratch projects, so
+# paths are stored relative to each process's working directory: a copy run
+# from its own directory is credited to `build` exactly like the original.
+relative_files = True
+include =
+    build
+    style.py
+# Every process counts: the test process, the child `build` forks to do the
+# work, and every runner the tests start. Each writes its own data file.
+parallel = True
+patch =
+    subprocess
+
+[report]
+show_missing = True
