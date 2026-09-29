@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests-linux:
+    name: Tests Linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The suite links one real program with the system `cc` and exercises
+      # the --strace audit wherever strace is present.
+      - name: Install strace
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends strace
+
+      - name: Run the test suite through the runner
+        run: ./build -k -j "$(nproc)" test
+
+      - name: Audit the test nodes' declared inputs
+        run: ./build -k -j "$(nproc)" --strace test
+
+  tests-darwin:
+    name: Tests Darwin
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run the test suite through the runner
+        run: ./build -k -j "$(sysctl -n hw.ncpu)" test

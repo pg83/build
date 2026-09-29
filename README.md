@@ -531,11 +531,18 @@ is redirected.
 
 ## Upstream development
 
-Run the self-contained test suite with:
+The runner tests itself through its own graph. `build.py` declares one node
+per test module, with the module and the file it covers as inputs, so
 
 ```sh
-python3 -m unittest
+./build test
 ```
+
+runs both modules in parallel and keeps a green module cached until it or the
+code it covers changes. `./build --strace test` audits the test nodes' declared
+inputs like any project's nodes. `python3 -m unittest` still runs the suite
+directly. CI (`.github/workflows/ci.yml`) runs `./build test` on Linux and
+macOS for every push and pull request.
 
 The `build` file is the distributable artifact. Projects should update their
 vendored copy from this repository without modifying it locally.

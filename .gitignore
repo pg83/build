@@ -1,0 +1,8 @@
+# build runner output
+/.build/
+/.build-*/
+# symlinks ./build publishes for explicitly named test nodes
+/test_build_system
+/test_style
+__pycache__/
+*.pyc
