@@ -1266,7 +1266,21 @@ class BuildSystemTest(unittest.TestCase):
         scanner = runner.IncludeScanner(context)
         self.assertEqual(
             scanner._parse("$(S)/source.c"),
-            [(False, "first.h"), (True, "second.h")],
+            [(False, False, "first.h"), (True, False, "second.h")],
+        )
+
+    def test_parser_marks_include_next_directives(self):
+        source = self.root / "source.c"
+        source.write_text(
+            "#include <first.h>\n"
+            "#include_next <second.h>\n"
+            '#include_next "third.h"\n'
+        )
+        context = self.context()
+        scanner = runner.IncludeScanner(context)
+        self.assertEqual(
+            scanner._parse("$(S)/source.c"),
+            [(False, False, "first.h"), (False, True, "second.h"), (True, True, "third.h")],
         )
 
     def test_strace_parser_counts_stat_and_file_backed_mmap(self):

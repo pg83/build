@@ -223,6 +223,7 @@ program(
     cflags=(),
     cxxflags=(),
     cppflags=(),
+    includes=(),
     public_cflags=(),
     public_cxxflags=(),
     public_cppflags=(),
@@ -251,7 +252,13 @@ srcs=[
 
 A declared `$(B)` input is replaced with a dependency on its producer. Source
 inputs are hashed directly. Other sources in the target do not inherit these
-inputs.
+inputs. A generated source cannot be scanned for includes at graph time, but
+its declared source-tree inputs are, so listing the headers it includes gives
+the compile node their include closure.
+
+`includes` adds target-local include roots. They follow the source root and
+precede `build.includes` on the compile command line and in include scanning,
+and they are not propagated to consumers.
 
 ### `library()`
 
@@ -263,6 +270,7 @@ library(
     cflags=(),
     cxxflags=(),
     cppflags=(),
+    includes=(),
     public_cflags=(),
     public_cxxflags=(),
     public_cppflags=(),
@@ -275,6 +283,7 @@ Builds a static archive, `$(B)/lib<name>.a` by default. A program links static
 library dependencies in dependency order. `public_*flags` propagate to
 consumers; ordinary compile flags affect only the target itself. `ldflags`
 propagate through dependencies and also participate in the final program link.
+`includes` behaves as for `program()`.
 
 ### `dependency()`
 
@@ -303,6 +312,7 @@ import_build(
     extra_cxxflags=(),
     extra_cppflags=(),
     deps=(),
+    namespace=None,
 )
 ```
 
@@ -319,6 +329,11 @@ already have a built output; that output is added to the imported program's
 dependency list and appended to its link command, followed by its transitive
 `ldflags`. This is useful when an imported test program must link an archive
 produced by the parent graph.
+
+`namespace` gives the import its own build prefix under `$(B)` instead of the
+child's source-relative directory, so the same `build.py` can be imported more
+than once with different extra flags (a ThinLTO flavour of a library next to
+the plain one, for example) without the two builds colliding.
 
 ### `pkg_config()`
 
@@ -369,6 +384,7 @@ command(
     ldflags=(),
     descr="GN",
     color="yellow",
+    local=False,
 )
 ```
 
@@ -382,6 +398,10 @@ The optional flag arguments are public usage requirements for consumers of the
 command target. `descr` is the progress label and must contain exactly two
 ASCII letters. `color` is one of `red`, `green`, `yellow`, `blue`, `magenta`,
 `cyan`, `white`, or their `light-*` variants.
+
+`local=True` pins the node to this machine under `--dist`: use it for nodes
+that need the network, the real source tree, or anything else a remote worker
+lacks.
 
 ### `group()`
 
@@ -403,14 +423,20 @@ The `install` group is selected when the CLI has no positional names.
 ## Include scanning and dependency inference
 
 C and C++ sources below `$(S)`, and sources declared with absolute paths, are
-scanned for quoted and angle-bracket `#include` directives. Comments are
-ignored. Resolution is recursive and cached for the duration of the build:
+scanned for quoted and angle-bracket `#include`, `#include_next` and `#import`
+directives. Comments are ignored. Resolution is recursive and cached for the
+duration of the build:
 
 1. A quoted include is tried relative to the including file.
-2. The source root and every entry in `build.includes` are searched.
+2. The source root, the target's `includes` and every entry in
+   `build.includes` are searched in that order.
 3. A matching source file becomes a hashed source input.
 4. A matching declared `$(B)` output adds its producer node as a dependency.
 5. An unresolved include is treated as a system header and ignored.
+
+`#include_next` skips the includer's own directory and continues the search
+from the include root after the one that supplied the including file, as the
+preprocessor does.
 
 Changing any transitively included project header therefore changes the
 compile node UID. Generated headers do not need to be repeated in a manual
@@ -446,8 +472,33 @@ On Linux, `--strace` reruns every selected node under `strace`, including cache
 hits, and rejects successful reads from the source tree that are not declared
 by the node or its transitive dependency closure. Generated files, build roots,
 `.git`, failed probes, and files created by the command itself are ignored.
-This mode requires `strace` on `PATH` and is intended for CI or periodic build
-graph audits rather than ordinary incremental builds.
+This mode requires `strace` on `PATH` and Python's `sqlite3` module (which
+backs the trace input index; an interpreter without it still runs every
+untraced build), and is intended for CI or periodic build graph audits rather
+than ordinary incremental builds. `--strace` and `--dist` are mutually
+exclusive.
+
+### Distributed builds
+
+```
+./build --dist=lab1,lab2 --dist=lab3:32 test
+```
+
+`--dist` adds ssh hosts as workers. Each host gets one ssh session; the engine
+sends itself over as `build exec` and then streams jobs to it. A job carries
+its command, environment and the manifests of its declared inputs; the host
+keeps a per-session content-addressed cache under `.build-exec` in its
+`TMPDIR` (the login directory when there is none), so every blob crosses the
+link at most once. Results land in the local CAS exactly as if the node had
+run here. Dropped sessions reconnect with backoff, and in-flight nodes go back
+to the queue. `HOST:N` overrides the slot count (default: the host's cores).
+
+Jobs run with the controller's `CC`, `CXX`, `AR` and `PATH` prepended to the
+host's own, and tool names stay unresolved in node UIDs, so every host looks
+the toolchain up itself; the same toolchain paths are assumed, not checked.
+A node that must stay on this machine is declared with `local=True`. A remote
+host only sees a node's declared inputs, so `--dist` also acts as a
+hermeticity gate. Set `BUILD_DIST_SSH` to use another ssh command.
 
 ## CLI
 
@@ -463,7 +514,8 @@ graph audits rather than ordinary incremental builds.
   -k, --keep-going      continue independent work after a failed node
   -v, --verbose         print cache hits and command starts
   -T, --ninja           repaint one progress line on a terminal
-      --strace           rerun nodes and reject undeclared source reads
+      --strace          rerun nodes and reject undeclared source reads
+      --dist HOST[:N],... also run nodes on these ssh hosts (repeatable)
       --clear           clear CAS, UID, temporary, and garbage directories
       --list            list named targets and groups without building
 ```
