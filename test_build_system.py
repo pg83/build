@@ -370,7 +370,7 @@ class BuildSystemTest(unittest.TestCase):
         self.assertIn("--target=aarch64-unknown-linux-gnu", app.nodes[0].commands[0])
 
         graph = json.loads(context.serialize_graph())
-        self.assertEqual(graph["version"], 2)
+        self.assertEqual(graph["version"], 3)
         support_archives = [
             record for record in graph["nodes"]
             if record["outputs"] == ["$(B)/libsupport.a"]
@@ -397,6 +397,55 @@ class BuildSystemTest(unittest.TestCase):
             ]),
             2,
         )
+
+    def test_host_copy_of_a_program_shares_its_nodes_uids(self):
+        # A -D flag makes the target configuration differ from the host one,
+        # so a program a command runs is imported again as a host tool. Its
+        # nodes are the native ones in every respect: same uids, one build.
+        project = self.root / "project"
+        project.mkdir()
+        (project / "support.c").write_text('#include "support.h"\nint support(void) { return 0; }\n')
+        (project / "support.h").write_text("// support\n")
+        (project / "tool.cpp").write_text("int main() { return 0; }\n")
+        (project / "build.py").write_text(
+            "import build\n"
+            "build.flags.allow({'ONLY': {'default': ''}})\n"
+            "support = library(srcs=['$(S)/support.c'])\n"
+            "tool = program(srcs=['$(S)/tool.cpp'], deps=[support])\n"
+            "generated = command(outputs=['$(B)/generated'], cmd=['$(B)/tool', '$(B)/generated'])\n"
+            "install(tool, generated)\n",
+        )
+        with mock.patch.dict("os.environ", self.fake_clang_environment(), clear=False):
+            context = runner.BuildContext(project, self.out, runner.Flags({"ONLY": "yes"}))
+            context.load(project / "build.py")
+            context.build_graph()
+            context.calculate_uids(context.nodes)
+        # the library is there twice, natively and behind the imported tool;
+        # the tool's own nodes are the import's alone
+        for prefix, count in (("$(B)/obj/support/", 2), ("$(B)/libsupport.a", 2), ("$(B)/obj/tool/", 1), ("$(B)/tool", 1)):
+            copies = [
+                node for node in context.nodes
+                if node.outputs and node.outputs[0].startswith(prefix)
+            ]
+            self.assertEqual(len(copies), count, prefix)
+            self.assertEqual(len({node.uid for node in copies}), 1, prefix)
+
+    def test_generated_source_names_its_producer_once(self):
+        # a generated source and the generated headers it declares come from
+        # one node: that node is one dependency, not one per file
+        context = self.context()
+        generator = context.command(
+            outputs=["$(B)/gen/main.c", "$(B)/gen/one.h", "$(B)/gen/two.h"],
+            cmd=["touch", "$(B)/gen/main.c", "$(B)/gen/one.h", "$(B)/gen/two.h"],
+        )
+        app = context.program(
+            name="app",
+            srcs=[{"src": "$(B)/gen/main.c", "inputs": ["$(B)/gen/one.h", "$(B)/gen/two.h"]}],
+            deps=[generator],
+        )
+        context.install(app)
+        context.build_graph()
+        self.assertEqual(app.nodes[0].deps, [generator.root])
 
     def test_cross_host_program_executes_inside_custom_command(self):
         project = self.root / "execute-host"

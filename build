@@ -647,7 +647,7 @@ class BuildContext:
     @staticmethod
     def _decode_graph(graph: Any, origin: Path) -> tuple[
             list[Node], set[Node], list[dict[str, Any]]]:
-        if not isinstance(graph, dict) or graph.get("version") not in (1, 2):
+        if not isinstance(graph, dict) or graph.get("version") not in (1, 2, 3):
             raise BuildError(f"unsupported build graph from {origin}")
         version = graph["version"]
         records = graph.get("nodes")
@@ -670,7 +670,10 @@ class BuildContext:
             env = record.get("env", {})
             node_id = record.get("id")
             deps = record.get("deps", [])
+            source_inputs = record.get("source_inputs", [])
             if (not isinstance(inputs, list) or not all(isinstance(x, str) for x in inputs)
+                    or not isinstance(source_inputs, list)
+                    or not all(isinstance(x, str) for x in source_inputs)
                     or not isinstance(outputs, list)
                     or not all(isinstance(x, str) for x in outputs)
                     or not isinstance(commands, list)
@@ -680,7 +683,7 @@ class BuildContext:
                     or not isinstance(cwd, str) or not isinstance(env, dict)
                     or not all(isinstance(key, str) and isinstance(value, str)
                                for key, value in env.items())
-                    or version == 2 and (
+                    or version >= 2 and (
                         not isinstance(node_id, str) or not node_id
                         or not isinstance(deps, list)
                         or not all(isinstance(dep, str) for dep in deps)
@@ -694,15 +697,17 @@ class BuildContext:
                 cwd=cwd,
                 env=env,
                 descr=str(record.get("descr", "GN")),
-                color=str(record.get("color", "" if version == 2 else "yellow")),
+                color=str(record.get("color", "" if version >= 2 else "yellow")),
             )
-            for path in inputs:
+            # a version 2 graph folded the scanned sources into the inputs;
+            # version 3 carries them apart
+            for path in [*inputs, *source_inputs]:
                 if path.startswith(S + "/") or os.path.isabs(path):
                     node.source_inputs.add(path)
             nodes.append(node)
             record_inputs.append(inputs)
             record_deps.append(deps)
-            if version == 2:
+            if version >= 2:
                 if node_id in ids:
                     raise BuildError(f"duplicate node id in build graph from {origin}: {node_id}")
                 ids[node_id] = node
@@ -715,7 +720,7 @@ class BuildContext:
                         raise BuildError(f"multiple imported producers for {output}")
                     producers[output] = node
 
-        if version == 2:
+        if version >= 2:
             for node, deps in zip(nodes, record_deps):
                 try:
                     node.deps = _uniq(ids[dep] for dep in deps)
@@ -737,7 +742,7 @@ class BuildContext:
                 node.inputs = _uniq(node.inputs)
 
         exports: list[dict[str, Any]] = []
-        if version == 2:
+        if version >= 2:
             encoded_exports = graph.get("exports", [])
             if (not isinstance(encoded_exports, list)
                     or not all(isinstance(export, dict) for export in encoded_exports)):
@@ -955,8 +960,12 @@ class BuildContext:
     def serialize_graph(self) -> str:
         bases: dict[Node, dict[str, Any]] = {}
         for node in self.nodes:
+            # declared inputs and scanned sources apart, as the node holds
+            # them: an importer rebuilds the node in the same shape, so a
+            # graph imported from the same configuration shares its uids
             record: dict[str, Any] = {
-                "inputs": sorted(set(node.inputs) | node.source_inputs),
+                "inputs": node.inputs,
+                "source_inputs": sorted(node.source_inputs),
                 "outputs": node.outputs,
                 "cmd": node.commands,
             }
@@ -1025,7 +1034,7 @@ class BuildContext:
             })
         exports.sort(key=lambda export: (export["output"], export["name"]))
         return json.dumps(
-            {"version": 2, "nodes": records, "exports": exports},
+            {"version": 3, "nodes": records, "exports": exports},
             sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         )
 
@@ -1230,7 +1239,7 @@ class BuildContext:
                     "-o",
                     obj,
                 ]],
-                deps=deps,
+                deps=_uniq(deps),
                 descr="CC", color="green", include_roots=source_include_roots,
                 # Generated sources cannot be scanned (they may not exist at
                 # graph time), but their declared source-tree inputs can: a
